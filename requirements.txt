@@ -1,0 +1,17 @@
+# Unlimited-OCR 扫描版 PDF 转 Markdown
+# Python 依赖
+
+# PDF 解析
+PyMuPDF>=1.24.0
+
+# 图片处理
+Pillow>=10.0.0
+
+# OpenAI Compatible API 客户端
+openai>=1.0.0
+
+# 配置文件
+PyYAML>=6.0
+
+# 进度条
+tqdm>=4.60.0

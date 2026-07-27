@@ -1,0 +1,45 @@
+# Unlimited-OCR 扫描版 PDF 转 Markdown 配置文件
+
+ocr:
+  api_base: "http://localhost:8000/v1"
+  model: "unlimited-ocr"          # 对应 vLLM --served-model-name
+  timeout: 300                    # vLLM 长文档可能需要更长时间
+  max_retries: 3
+  skip_special_tokens: false      # vLLM 必需：保留 <|det|> 标记
+  ngram_size: 35                  # 防重复 n-gram 大小
+  ngram_window_single: 128        # 单页窗口
+  ngram_window_multi: 1024        # 多页窗口
+
+pdf:
+  dpi: 300
+  format: "png"
+
+postprocess:
+  remove_headers: true
+  remove_footers: true
+  remove_page_numbers: true
+  remove_ads: true
+  merge_broken_lines: true
+  merge_broken_words: true
+  header_patterns: []       # 用户自定义页眉正则
+  footer_patterns: []       # 用户自定义页脚正则
+  ad_patterns:              # 广告关键词
+    - "Subscribe now"
+    - "Advertisement"
+
+translation:
+  enabled: false            # 默认关闭
+  api_base: "http://localhost:8080/v1"
+  model: "sisyphus"
+  target_language: "Chinese"
+  timeout: 120
+  batch_size: 10            # 每次翻译的元素数
+
+output:
+  page_separator: true      # 页面间插入 --- Page N ---
+  single_file: true         # 整本书输出为单个 .md
+
+paths:
+  input_dir: "input"
+  output_dir: "output"
+  log_dir: "logs"

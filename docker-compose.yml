@@ -1,0 +1,34 @@
+services:
+  unlimited-ocr:
+    image: vllm/vllm-openai:unlimited-ocr
+    container_name: unlimited-ocr
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    ipc: host
+    volumes:
+      - /mnt/g/models/OCR/Unlimited-OCR-NVFP4:/model
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities:
+                - gpu
+    command:
+      - /model
+      - --served-model-name
+      - unlimited-ocr
+      - --trust-remote-code
+      - --logits_processors
+      - "vllm.model_executor.models.unlimited_ocr:NGramPerReqLogitsProcessor"
+      - --no-enable-prefix-caching
+      - --mm-processor-cache-gb
+      - "0"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --max-model-len
+      - "32768"

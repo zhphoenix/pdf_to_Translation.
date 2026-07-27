@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment variables
+.env
+.env.*
+
+# Project outputs
+output/
+logs/*.log
+
+# Model files
+models/*.gguf
+models/*.safetensors
+models/*.bin
+
+# Input PDFs (large files)
+input/*.pdf
+
+# OS
+.DS_Store
+Thumbs.db
