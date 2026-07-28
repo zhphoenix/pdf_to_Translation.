@@ -1,8 +1,18 @@
+# Unlimited-OCR 服务编排
+# 注意：RTX 5060 Ti 16GB 显存不足以同时运行两个模型
+# 使用 run_pipeline.sh 串行调度，或手动分步启动
+#
+# 手动分步:
+#   docker compose up -d unlimited-ocr     # 第一步: OCR
+#   docker compose stop unlimited-ocr      # OCR 完成后停止
+#   docker compose up -d sisyphus          # 第二步: 翻译
+#   docker compose stop sisyphus           # 翻译完成后停止
+
 services:
   unlimited-ocr:
     image: vllm/vllm-openai:unlimited-ocr
     container_name: unlimited-ocr
-    restart: unless-stopped
+    # 不使用 restart: unless-stopped，避免与翻译服务争抢显存
     ports:
       - "8000:8000"
     ipc: host
@@ -32,3 +42,51 @@ services:
       - "8000"
       - --max-model-len
       - "32768"
+    profiles:
+      - ocr    # 仅在 --profile ocr 或显式指定时启动
+
+  sisyphus:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda13
+    container_name: sisyphus
+    ports:
+      - "8080:8080"
+    ipc: host
+    volumes:
+      - /mnt/g/models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities:
+                - gpu
+    command:
+      - -m
+      - /models/unsloth/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --flash-attn
+      - "on"
+      - --cache-type-k
+      - q4_0
+      - --cache-type-v
+      - q4_0
+      - -ngl
+      - "99"
+      - -c
+      - "65536"
+      - --spec-type
+      - draft-mtp
+      - --spec-draft-n-max
+      - "6"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    profiles:
+      - translate    # 仅在 --profile translate 或显式指定时启动

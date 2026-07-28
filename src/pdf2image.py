@@ -102,7 +102,8 @@ def get_page_count(pdf_path: Path) -> int:
 def extract_page_image(
     pdf_path: Path,
     page_num: int,
-    dpi: Optional[int] = None
+    dpi: Optional[int] = None,
+    image_format: Optional[str] = None
 ) -> bytes:
     """
     提取单页为图片字节（不保存到文件）
@@ -111,12 +112,15 @@ def extract_page_image(
         pdf_path: PDF 文件路径
         page_num: 页码（从 0 开始）
         dpi: 渲染 DPI
+        image_format: 图片格式 (jpeg/png)，默认从配置读取
         
     Returns:
-        PNG 图片字节数据
+        图片字节数据
     """
     if dpi is None:
         dpi = config.get("pdf.dpi", 300)
+    if image_format is None:
+        image_format = config.get("pdf.ocr_format", "jpeg")
     
     doc = fitz.open(str(pdf_path))
     
@@ -127,9 +131,14 @@ def extract_page_image(
     page = doc[page_num]
     zoom = dpi / 72.0
     matrix = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=matrix)
+    pix = page.get_pixmap(matrix=matrix, alpha=False)
     
-    image_bytes = pix.tobytes("png")
+    if image_format == "jpeg":
+        # JPEG: 编码快 3-5x，体积小 70%，适合 API 传输
+        image_bytes = pix.tobytes("jpeg", jpg_quality=95)
+    else:
+        image_bytes = pix.tobytes("png")
+    
     doc.close()
     
     return image_bytes

@@ -73,6 +73,16 @@ class OCRElement:
             "page": self.page,
         }
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "OCRElement":
+        """从字典反序列化"""
+        return cls(
+            type=d["type"],
+            bbox=tuple(d["bbox"]),
+            text=d["text"],
+            page=d.get("page", 0)
+        )
+
 
 # ─── 解析正则 ──────────────────────────────────────────────────────
 # vLLM 输出格式: <|det|>type [x1, y1, x2, y2]<|/det|>content
@@ -227,19 +237,26 @@ class OCREngine:
         return parse_ocr_output(raw, page_num)
 
     def ocr_image_bytes(
-        self, image_bytes: bytes, mime_type: str = "image/png", page_num: int = 0
+        self, image_bytes: bytes, mime_type: str = None, page_num: int = 0
     ) -> List[OCRElement]:
         """
         对图片字节数据进行 OCR
 
         Args:
             image_bytes: 图片字节数据
-            mime_type: 图片 MIME 类型
+            mime_type: 图片 MIME 类型（默认自动检测 JPEG/PNG）
             page_num: 页码
 
         Returns:
             OCRElement 列表
         """
+        # 自动检测图片格式
+        if mime_type is None:
+            if image_bytes[:2] == b'\xff\xd8':
+                mime_type = "image/jpeg"
+            else:
+                mime_type = "image/png"
+
         base64_image = base64.b64encode(image_bytes).decode("utf-8")
         raw = self._call_api(base64_image, mime_type)
         elements = parse_ocr_output(raw, page_num)
