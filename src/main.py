@@ -375,95 +375,118 @@ def step_ocr(pdf_files: List[Path], output_dir: Path, dpi: int = None):
                 else:
                     ocr_tasks.append((i, page_no))
 
-            # ─── 第二阶段：预渲染 + 并发 OCR API ───
+            # ─── 第二阶段：分批预渲染 + 并发 OCR API + 每批保存 ───
+            OCR_BATCH_SIZE = 10  # 每批处理页数，处理完保存并释放内存
             low_value_count = 0
-            ocr_results = {}  # page_idx -> elements
             progress = create_progress_bar(total_pages, f"OCR {pdf_name[:20]}")
             # 先更新已跳过页的进度
             progress.update(skipped_count)
 
-            if concurrency <= 1 or len(ocr_tasks) <= 1:
-                # 串行回退
-                for page_idx, page_no in ocr_tasks:
-                    try:
-                        _, elements = _ocr_single_page(ocr_engine, pdf_path, page_idx, page_no, dpi)
-                    except Exception as e:
-                        logger.error(f"  OCR 失败: 第 {page_no} 页, {e}")
-                        elements = []
-                    ocr_results[page_idx] = elements
-                    progress.update(1)
-            else:
-                # 预渲染所有页面（CPU 密集，串行执行，JPEG 编码很快）
-                rendered_images = {}  # page_idx -> image_bytes
-                for page_idx, page_no in ocr_tasks:
-                    try:
-                        rendered_images[page_idx] = extract_page_image(pdf_path, page_idx, dpi=dpi)
-                    except Exception as e:
-                        logger.error(f"  渲染失败: 第 {page_no} 页, {e}")
-                        rendered_images[page_idx] = None
+            # 分批处理：每批渲染 → OCR → 后处理 → 保存 → 释放
+            batch_start = 0
+            while batch_start < len(ocr_tasks):
+                batch_tasks = ocr_tasks[batch_start:batch_start + OCR_BATCH_SIZE]
+                batch_end_page = batch_tasks[-1][1]  # 批次最后一页号
 
-                # 并发 API 调用（I/O 密集，充分利用 vLLM continuous batching）
-                with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                    future_map = {}
-                    for page_idx, page_no in ocr_tasks:
-                        img = rendered_images.get(page_idx)
-                        if img is None:
-                            ocr_results[page_idx] = []
-                            progress.update(1)
-                            continue
-                        future = executor.submit(
-                            _ocr_api_only, ocr_engine, img, page_no
-                        )
-                        future_map[future] = (page_idx, page_no)
-
-                    for future in as_completed(future_map):
-                        page_idx, page_no = future_map[future]
+                if concurrency <= 1 or len(batch_tasks) <= 1:
+                    # 串行：逐页渲染+OCR
+                    for page_idx, page_no in batch_tasks:
                         try:
-                            elements = future.result()
+                            _, elements = _ocr_single_page(ocr_engine, pdf_path, page_idx, page_no, dpi)
                         except Exception as e:
                             logger.error(f"  OCR 失败: 第 {page_no} 页, {e}")
                             elements = []
-                        ocr_results[page_idx] = elements
+                        # 即时后处理
+                        elements = post_processor.process_page(elements)
+                        page_skipped = False
+                        page_reason = ""
+                        if skip_enabled and _count_text_elements(elements) < min_ocr_elements:
+                            page_skipped = True
+                            page_reason = f"low-value page ({_count_text_elements(elements)} text elements)"
+                            logger.info(f"第 {page_no} 页 OCR 内容过少，标记为低价值页")
+                            elements = [_make_placeholder_element(page_no, "low-value")]
+                            low_value_count += 1
+                        pages_data[page_idx] = {
+                            "page": page_no,
+                            "skipped": page_skipped,
+                            "reason": page_reason,
+                            "elements": [e.to_dict() for e in elements],
+                        }
                         progress.update(1)
+                else:
+                    # 并发：仅预渲染当前批次
+                    rendered_images = {}
+                    for page_idx, page_no in batch_tasks:
+                        try:
+                            rendered_images[page_idx] = extract_page_image(pdf_path, page_idx, dpi=dpi)
+                        except Exception as e:
+                            logger.error(f"  渲染失败: 第 {page_no} 页, {e}")
+                            rendered_images[page_idx] = None
 
-                # 释放渲染图片内存
-                rendered_images.clear()
+                    # 并发 API 调用
+                    batch_results = {}
+                    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                        future_map = {}
+                        for page_idx, page_no in batch_tasks:
+                            img = rendered_images.get(page_idx)
+                            if img is None:
+                                batch_results[page_idx] = []
+                                progress.update(1)
+                                continue
+                            future = executor.submit(
+                                _ocr_api_only, ocr_engine, img, page_no
+                            )
+                            future_map[future] = (page_idx, page_no)
+
+                        for future in as_completed(future_map):
+                            page_idx, page_no = future_map[future]
+                            try:
+                                elements = future.result()
+                            except Exception as e:
+                                logger.error(f"  OCR 失败: 第 {page_no} 页, {e}")
+                                elements = []
+                            batch_results[page_idx] = elements
+                            progress.update(1)
+
+                    # 释放渲染图片内存
+                    rendered_images.clear()
+
+                    # 后处理当前批次
+                    for page_idx, _ in batch_tasks:
+                        page_no = page_idx + 1
+                        elements = batch_results.get(page_idx, [])
+                        elements = post_processor.process_page(elements)
+                        page_skipped = False
+                        page_reason = ""
+                        if skip_enabled and _count_text_elements(elements) < min_ocr_elements:
+                            page_skipped = True
+                            page_reason = f"low-value page ({_count_text_elements(elements)} text elements)"
+                            logger.info(f"第 {page_no} 页 OCR 内容过少，标记为低价值页")
+                            elements = [_make_placeholder_element(page_no, "low-value")]
+                            low_value_count += 1
+                        pages_data[page_idx] = {
+                            "page": page_no,
+                            "skipped": page_skipped,
+                            "reason": page_reason,
+                            "elements": [e.to_dict() for e in elements],
+                        }
+
+                    # 释放批次结果内存
+                    batch_results.clear()
+
+                # 每批保存中间 JSON（断点续传）
+                interim_data = {
+                    "source": str(pdf_path),
+                    "total_pages": total_pages,
+                    "pages": pages_data,
+                }
+                with open(json_file, "w", encoding="utf-8") as f:
+                    json.dump(interim_data, f, ensure_ascii=False, indent=2)
+                logger.debug(f"  中间保存: 已完成至第 {batch_end_page} 页")
+
+                batch_start += OCR_BATCH_SIZE
 
             progress.close()
-
-            # ─── 第三阶段：后处理 + 组装结果（按页序）───
-            for page_idx, _ in ocr_tasks:
-                page_no = page_idx + 1
-                elements = ocr_results.get(page_idx, [])
-
-                # 后处理（单页）
-                elements = post_processor.process_page(elements)
-
-                # 后置检查：有效文本元素过少 → 标记低价值页
-                page_skipped = False
-                page_reason = ""
-                if skip_enabled and _count_text_elements(elements) < min_ocr_elements:
-                    page_skipped = True
-                    page_reason = f"low-value page ({_count_text_elements(elements)} text elements)"
-                    logger.info(f"第 {page_no} 页 OCR 内容过少，标记为低价值页")
-                    elements = [_make_placeholder_element(page_no, "low-value")]
-                    low_value_count += 1
-
-                pages_data[page_idx] = {
-                    "page": page_no,
-                    "skipped": page_skipped,
-                    "reason": page_reason,
-                    "elements": [e.to_dict() for e in elements],
-                }
-
-            # 保存页级 JSON
-            data = {
-                "source": str(pdf_path),
-                "total_pages": total_pages,
-                "pages": pages_data,
-            }
-            with open(json_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
 
             elapsed = time.time() - start_time
             total_elem = sum(len(p["elements"]) for p in pages_data)
@@ -483,6 +506,9 @@ def step_ocr(pdf_files: List[Path], output_dir: Path, dpi: int = None):
 def step_translate(input_dir: Path, output_dir: Path, output_format: str = "markdown"):
     """
     第二步：读取中间 JSON，翻译并输出
+
+    支持断点续翻：每页翻译完成后保存 checkpoint（.translate.json），
+    中断后重新运行自动从上次完成的页面继续。
 
     Args:
         input_dir: 包含 .ocr.json 的目录
@@ -508,6 +534,8 @@ def step_translate(input_dir: Path, output_dir: Path, output_format: str = "mark
     success = 0
     for json_file in json_files:
         base_name = json_file.stem.replace(".ocr", "")
+        safe_name = sanitize_filename(base_name)
+        checkpoint_file = output_dir / f"{safe_name}.translate.json"
         logger.info(f"翻译: {json_file.name}")
         start_time = time.time()
 
@@ -521,27 +549,89 @@ def step_translate(input_dir: Path, output_dir: Path, output_format: str = "mark
             pages: List[List[OCRElement]] = []
             for p in raw_pages:
                 if isinstance(p, dict):
-                    # 新格式：{"page", "skipped", "reason", "elements": [...]}
                     elems = [OCRElement.from_dict(d) for d in p.get("elements", [])]
                 else:
-                    # 旧格式：直接是元素 dict 列表
                     elems = [OCRElement.from_dict(d) for d in p]
                 pages.append(elems)
 
+            total_pages = len(pages)
+
+            # ─── 断点续翻：加载 checkpoint ───
+            translated_pages: List[Optional[List[OCRElement]]] = [None] * total_pages
+            start_page = 0
+            if checkpoint_file.exists():
+                try:
+                    with open(checkpoint_file, "r", encoding="utf-8") as f:
+                        ckpt = json.load(f)
+                    start_page = ckpt.get("completed_pages", 0)
+                    ckpt_pages = ckpt.get("pages", [])
+                    for i, cp in enumerate(ckpt_pages):
+                        if cp is not None and i < total_pages:
+                            translated_pages[i] = [
+                                OCRElement.from_dict(d) for d in cp
+                            ]
+                    logger.info(
+                        f"断点续翻: 从第 {start_page + 1}/{total_pages} 页继续"
+                    )
+                except Exception as e:
+                    logger.warning(f"Checkpoint 加载失败，从头开始: {e}")
+                    start_page = 0
+                    translated_pages = [None] * total_pages
+
+            # ─── 逐页翻译（带 checkpoint 保存 + 进度条）───
+            progress = create_progress_bar(total_pages, f"翻译 {safe_name[:25]}")
+            progress.update(start_page)  # 跳过已完成页
+
+            # 每 N 页保存一次中间输出（稳定性保障）
+            interim_save_interval = 10
+
+            for i in range(start_page, total_pages):
+                translated_pages[i] = translator.translate_elements(pages[i])
+                progress.update(1)
+
+                # 每页完成后保存 checkpoint
+                ckpt_data = {
+                    "source": str(json_file),
+                    "completed_pages": i + 1,
+                    "total_pages": total_pages,
+                    "pages": [
+                        [e.to_dict() for e in tp] if tp is not None else None
+                        for tp in translated_pages
+                    ],
+                }
+                with open(checkpoint_file, "w", encoding="utf-8") as f:
+                    json.dump(ckpt_data, f, ensure_ascii=False)
+
+                # 每 N 页保存一次中间 Markdown 输出（稳定性保障）
+                if (i + 1) % interim_save_interval == 0 or i == total_pages - 1:
+                    interim_pages = [tp if tp is not None else pages[j] for j, tp in enumerate(translated_pages)]
+                    generator = create_markdown_generator()
+                    interim_md = generator.generate_document(interim_pages)
+                    interim_file = output_dir / f"{safe_name}.interim.md"
+                    with open(interim_file, "w", encoding="utf-8") as f:
+                        f.write(interim_md)
+                    logger.debug(f"中间输出已保存: {interim_file.name} ({i + 1}/{total_pages} 页)")
+
+            progress.close()
+
+            # ─── 生成最终输出 ───
+            final_pages = [tp if tp is not None else pages[i] for i, tp in enumerate(translated_pages)]
+
             if output_format == "text":
-                # 纯文本输出
-                final_text = translator.translate_pages_to_text(pages)
-                output_file = output_dir / f"{sanitize_filename(base_name)}_translated.txt"
+                final_text = translator._pages_to_plain_text(final_pages)
+                output_file = output_dir / f"{safe_name}_translated.txt"
                 with open(output_file, "w", encoding="utf-8") as f:
                     f.write(final_text)
             else:
-                # Markdown 输出
-                translated_pages = translator.translate_pages(pages)
                 generator = create_markdown_generator()
-                final_markdown = generator.generate_document(translated_pages)
-                output_file = output_dir / f"{sanitize_filename(base_name)}.md"
+                final_markdown = generator.generate_document(final_pages)
+                output_file = output_dir / f"{safe_name}.md"
                 with open(output_file, "w", encoding="utf-8") as f:
                     f.write(final_markdown)
+
+            # 翻译完成，删除 checkpoint
+            if checkpoint_file.exists():
+                checkpoint_file.unlink()
 
             elapsed = time.time() - start_time
             logger.info(f"  完成: 耗时 {elapsed:.1f}s → {output_file.name}")
@@ -549,6 +639,7 @@ def step_translate(input_dir: Path, output_dir: Path, output_format: str = "mark
 
         except Exception as e:
             logger.error(f"  翻译失败: {json_file.name}, {e}")
+            logger.info(f"  进度已保存至 checkpoint: {checkpoint_file.name}")
 
     logger.info(f"翻译步骤完成: {success}/{len(json_files)} 个文件")
     return success

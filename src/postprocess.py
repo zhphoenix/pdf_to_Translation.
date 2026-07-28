@@ -26,6 +26,13 @@ CONTENT_TYPES = {"text", "title", "caption", "list_item", "table_cell"}
 class StructuredPostProcessor:
     """结构化后处理器"""
 
+    # OCR 模型系统提示词泄漏特征（幻觉文本开头）
+    HALLUCINATION_PREFIXES = (
+        "The Ground Truth image displays",
+        "The image contains no text",
+        "According to Rule",
+    )
+
     def __init__(self):
         """初始化后处理器"""
         self.remove_headers = config.get("postprocess.remove_headers", True)
@@ -33,6 +40,18 @@ class StructuredPostProcessor:
         self.remove_page_numbers = config.get("postprocess.remove_page_numbers", True)
         self.remove_ads = config.get("postprocess.remove_ads", True)
         self.merge_broken_lines = config.get("postprocess.merge_broken_lines", True)
+
+        # 质量过滤参数
+        self.quality_filter_enabled = config.get("postprocess.quality_filter.enabled", True)
+        self.repeat_min_length = config.get("postprocess.quality_filter.repeat_min_length", 500)  # 降低阈值捕获短文本重复
+        self.repeat_max_ratio = config.get("postprocess.quality_filter.repeat_max_ratio", 0.5)
+        self.repeat_ngram_size = config.get("postprocess.quality_filter.repeat_ngram_size", 15)
+        self.sentence_repeat_threshold = config.get("postprocess.quality_filter.sentence_repeat_threshold", 3)  # 同一句子出现N次触发截断
+        self.dedup_similarity_threshold = config.get("postprocess.quality_filter.dedup_similarity_threshold", 0.85)  # 元素去重相似度阈值
+        self.hallucination_prefixes = tuple(
+            config.get("postprocess.quality_filter.hallucination_prefixes",
+                       list(self.HALLUCINATION_PREFIXES))
+        )
 
         # 广告关键词
         self.ad_patterns = config.get("postprocess.ad_patterns", [
@@ -66,6 +85,10 @@ class StructuredPostProcessor:
         Returns:
             处理后的元素列表
         """
+        # 0. 质量过滤（重复退化 + 幻觉检测 + 句子重复检测）
+        if self.quality_filter_enabled:
+            elements = self._quality_filter_page(elements)
+
         # 1. 按类型过滤
         elements = self._filter_by_type(elements)
 
@@ -79,6 +102,10 @@ class StructuredPostProcessor:
         # 4. 合并相邻文本块
         if self.merge_broken_lines:
             elements = self._merge_adjacent_text(elements)
+
+        # 5. 元素级去重（检测相似/重复的元素）
+        if self.quality_filter_enabled:
+            elements = self._deduplicate_elements(elements)
 
         return elements
 
@@ -284,6 +311,205 @@ class StructuredPostProcessor:
             return False
         sentence_endings = '.?!。？！'
         return text.rstrip()[-1] in sentence_endings if text.rstrip() else False
+
+    # ─── 质量过滤 ─────────────────────────────────────────────
+
+    def _quality_filter_page(self, elements: List[OCRElement]) -> List[OCRElement]:
+        """
+        OCR 输出质量过滤：检测并清理重复退化和幻觉文本
+
+        Args:
+            elements: OCR 元素列表
+
+        Returns:
+            过滤后的元素列表
+        """
+        result = []
+        page = elements[0].page if elements else 0
+
+        for elem in elements:
+            text = elem.text.strip()
+            if not text:
+                result.append(elem)
+                continue
+
+            # 检测1: 幻觉文本（OCR 模型系统提示词泄漏）
+            if self._is_hallucination(text):
+                logger.warning(
+                    f"[质量过滤] Page {page}: 移除幻觉文本 "
+                    f"(len={len(text)}, 开头: {text[:60]}...)"
+                )
+                continue  # 直接丢弃
+
+            # 检测2: 重复退化（n-gram 唯一比过低）
+            if len(text) > self.repeat_min_length:
+                ratio = self._ngram_unique_ratio(text, self.repeat_ngram_size)
+                if ratio < self.repeat_max_ratio:
+                    truncated = self._truncate_repetition(text)
+                    if truncated and len(truncated) > 50:
+                        logger.warning(
+                            f"[质量过滤] Page {page}: 重复退化截断 "
+                            f"(原长={len(text):,}, ratio={ratio:.4f}, "
+                            f"截断后={len(truncated):,})"
+                        )
+                        elem = OCRElement(
+                            type=elem.type, bbox=elem.bbox,
+                            text=truncated, page=elem.page
+                        )
+                    else:
+                        logger.warning(
+                            f"[质量过滤] Page {page}: 移除重复退化文本 "
+                            f"(原长={len(text):,}, ratio={ratio:.4f}, 截断后过短)"
+                        )
+                        continue  # 截断后太短，丢弃
+
+            result.append(elem)
+
+        return result
+
+    def _is_hallucination(self, text: str) -> bool:
+        """检测文本是否为 OCR 模型幻觉（系统提示词泄漏）"""
+        return text.startswith(self.hallucination_prefixes)
+
+    @staticmethod
+    def _ngram_unique_ratio(text: str, n: int) -> float:
+        """
+        计算 n-gram 唯一比（去重后唯一 n-gram 数 / 总 n-gram 数）
+
+        正常英文文本接近 1.0，重复退化文本接近 0
+        """
+        if len(text) <= n:
+            return 1.0
+        ngrams = [text[i:i + n] for i in range(len(text) - n)]
+        total = len(ngrams)
+        unique = len(set(ngrams))
+        return unique / total if total > 0 else 1.0
+
+    @staticmethod
+    def _truncate_repetition(text: str, n: int = 20, window: int = 500) -> str:
+        """
+        截断重复退化文本，保留重复起始前的正常内容
+
+        算法：用滑动窗口检测局部 n-gram 唯一比急剧下降的位置，
+        在该位置截断，保留前面的正常内容。
+
+        Args:
+            text: 原始文本
+            n: 检测重复的 n-gram 大小
+            window: 滑动窗口大小（字符数）
+
+        Returns:
+            截断后的文本
+        """
+        if len(text) <= window:
+            return text
+
+        # 用滑动窗口检测局部 n-gram 唯一比
+        step = window // 2
+        window_ratios = []
+
+        for start in range(0, len(text) - window, step):
+            chunk = text[start:start + window]
+            ngrams = [chunk[i:i + n] for i in range(len(chunk) - n)]
+            if not ngrams:
+                continue
+            unique = len(set(ngrams))
+            ratio = unique / len(ngrams)
+            window_ratios.append((start, ratio))
+
+        if not window_ratios:
+            return text
+
+        # 找到第一个局部唯一比 < 0.7 的位置（正常英文文本始终 > 0.95）
+        cut_pos = None
+        for pos, ratio in window_ratios:
+            if ratio < 0.7:
+                cut_pos = pos
+                break
+
+        if cut_pos is None:
+            return text
+
+        # 在截断点附近寻找句子边界
+        truncated = text[:cut_pos].rstrip()
+        for sep in ['. ', '。', '\n', '.\n']:
+            last_sep = truncated.rfind(sep)
+            if last_sep > len(truncated) * 0.3:
+                truncated = truncated[:last_sep + len(sep)]
+                break
+
+        return truncated.strip()
+
+    # ─── 元素级去重 ─────────────────────────────────────
+
+    def _deduplicate_elements(self, elements: List[OCRElement]) -> List[OCRElement]:
+        """
+        元素级去重：检测并移除内容高度相似的重复元素
+
+        算法：对每个元素生成文本指纹，与已保留元素比对，
+        相似度超过阈值的视为重复并跳过。
+
+        Args:
+            elements: OCR 元素列表
+
+        Returns:
+            去重后的元素列表
+        """
+        if not elements:
+            return []
+
+        result = []
+        seen_texts = []  # 已保留元素的文本
+
+        for elem in elements:
+            text = elem.text.strip()
+            if not text or len(text) < 50:  # 短文本不去重（可能是标题等）
+                result.append(elem)
+                continue
+
+            # 与已保留元素比对
+            is_duplicate = False
+            for seen_text in seen_texts:
+                similarity = self._text_similarity(text, seen_text)
+                if similarity >= self.dedup_similarity_threshold:
+                    logger.info(
+                        f"[去重] 跳过重复元素 (相似度={similarity:.2f}, "
+                        f"len={len(text)}, 开头: {text[:40]}...)"
+                    )
+                    is_duplicate = True
+                    break
+
+            if not is_duplicate:
+                result.append(elem)
+                seen_texts.append(text)
+
+        return result
+
+    @staticmethod
+    def _text_similarity(text1: str, text2: str) -> float:
+        """
+        计算两段文本的相似度（基于字符级 Jaccard 系数）
+
+        Args:
+            text1, text2: 待比较的文本
+
+        Returns:
+            相似度 [0, 1]，1 表示完全相同
+        """
+        if text1 == text2:
+            return 1.0
+
+        # 用 3-gram 集合计算 Jaccard 相似度
+        n = 3
+        set1 = {text1[i:i+n] for i in range(len(text1) - n + 1)}
+        set2 = {text2[i:i+n] for i in range(len(text2) - n + 1)}
+
+        if not set1 or not set2:
+            return 0.0
+
+        intersection = len(set1 & set2)
+        union = len(set1 | set2)
+        return intersection / union if union > 0 else 0.0
 
 
 def create_post_processor() -> StructuredPostProcessor:

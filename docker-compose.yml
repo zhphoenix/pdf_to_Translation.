@@ -1,31 +1,54 @@
-# Unlimited-OCR 服务编排
-# 注意：RTX 5060 Ti 16GB 显存不足以同时运行两个模型
-# 使用 run_pipeline.sh 串行调度，或手动分步启动
+# =============================================================================
+# Unlimited-OCR 扫描版 PDF 转 Markdown - 服务编排
+# =============================================================================
 #
-# 手动分步:
-#   docker compose up -d unlimited-ocr     # 第一步: OCR
-#   docker compose stop unlimited-ocr      # OCR 完成后停止
-#   docker compose up -d sisyphus          # 第二步: 翻译
-#   docker compose stop sisyphus           # 翻译完成后停止
+# 架构说明:
+#   本项目仅管理 OCR 服务（vLLM + Unlimited-OCR-NVFP4）
+#   翻译服务（sisyphus）由 ai-platform 独立管理，不在此项目中
+#
+# 服务依赖:
+#   OCR:    http://localhost:8000/v1  (本文件管理)
+#   翻译:   http://localhost:8080/v1  (外部: /mnt/e/ai-platform/sisyphus/)
+#
+# 使用方式:
+#   启动 OCR:     docker compose up -d
+#   查看日志:     docker compose logs -f ocr
+#   停止 OCR:     docker compose stop
+#   检查状态:     curl -sf http://localhost:8000/health
+#
+# 翻译服务管理 (独立项目):
+#   启动:         cd /mnt/e/ai-platform/sisyphus && docker compose up -d
+#   检查状态:     curl -sf http://localhost:8080/health
+#
+# 显存注意:
+#   RTX 5060 Ti 16GB 不足以同时运行 OCR 和翻译模型
+#   如需同时运行，请先停止一个服务
+# =============================================================================
 
 services:
-  unlimited-ocr:
+  # ---------------------------------------------------------------------------
+  # OCR 服务: vLLM + Unlimited-OCR-NVFP4
+  # 端口: 8000
+  # 模型: /mnt/g/models/OCR/Unlimited-OCR-NVFP4
+  # ---------------------------------------------------------------------------
+  ocr:
     image: vllm/vllm-openai:unlimited-ocr
-    container_name: unlimited-ocr
-    # 不使用 restart: unless-stopped，避免与翻译服务争抢显存
+    container_name: ocr
+    restart: unless-stopped
     ports:
       - "8000:8000"
-    ipc: host
     volumes:
-      - /mnt/g/models/OCR/Unlimited-OCR-NVFP4:/model
+      - /mnt/g/models/OCR/Unlimited-OCR-NVFP4:/model:ro
+    networks:
+      - ocr-net
+    ipc: host  # vLLM 需要共享内存
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               count: all
-              capabilities:
-                - gpu
+              capabilities: [gpu]
     command:
       - /model
       - --served-model-name
@@ -42,51 +65,18 @@ services:
       - "8000"
       - --max-model-len
       - "32768"
-    profiles:
-      - ocr    # 仅在 --profile ocr 或显式指定时启动
-
-  sisyphus:
-    image: ghcr.io/ggml-org/llama.cpp:server-cuda13
-    container_name: sisyphus
-    ports:
-      - "8080:8080"
-    ipc: host
-    volumes:
-      - /mnt/g/models:/models
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities:
-                - gpu
-    command:
-      - -m
-      - /models/unsloth/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8080"
-      - --flash-attn
-      - "on"
-      - --cache-type-k
-      - q4_0
-      - --cache-type-v
-      - q4_0
-      - -ngl
-      - "99"
-      - -c
-      - "65536"
-      - --spec-type
-      - draft-mtp
-      - --spec-draft-n-max
-      - "6"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 30s
-    profiles:
-      - translate    # 仅在 --profile translate 或显式指定时启动
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s  # vLLM 模型加载需要时间
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+networks:
+  ocr-net:
+    driver: bridge

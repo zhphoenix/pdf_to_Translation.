@@ -41,16 +41,34 @@ postprocess:
   ad_patterns:              # 广告关键词
     - "Subscribe now"
     - "Advertisement"
+  # OCR 输出质量过滤（检测重复退化和幻觉文本）
+  quality_filter:
+    enabled: true
+    repeat_min_length: 500         # 文本超过此长度才检测重复（降低以捕获短文本重复）
+    repeat_max_ratio: 0.5          # 15-gram 唯一比低于此值判定为重复退化
+    repeat_ngram_size: 15          # 重复检测的 n-gram 大小
+    sentence_repeat_threshold: 3   # 同一句子出现 N 次触发截断
+    dedup_similarity_threshold: 0.85  # 元素去重相似度阈值（Jaccard 系数）
+    hallucination_prefixes:        # OCR 模型幻觉特征（文本开头匹配）
+      - "The Ground Truth image displays"
+      - "The image contains no text"
+      - "According to Rule"
 
+# 翻译服务（本地推理模型 Qwythos-9B-Claude-Mythos）
+# 推理模型特性：响应包含 reasoning_content（思考过程）+ content（译文）
+# 容器由 /mnt/e/ai-platform/sisyphus/ 独立管理，不在此项目中
 translation:
   enabled: false            # 默认关闭
   api_base: "http://localhost:8080/v1"
-  model: "/models/unsloth/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf"
+  api_key: "not-needed"
+  model: "sisyphus"
   target_language: "简体中文"
   timeout: 300              # 长文本翻译需要更多时间
-  batch_size: 5             # 每次翻译的元素数（质量优先）
-  max_tokens: 8192          # 单次请求最大生成 token
+  batch_size: 3             # 每次翻译的元素数（减小以避免模型截断）
+  max_tokens: 4096          # 关闭推理后仅需译文 token（原 16384）
   temperature: 0.3          # 低温度保证翻译稳定性
+  repeat_penalty: 1.1       # 重复惩罚（仅本地模型生效）
+  disable_thinking: true    # 关闭推理思考（翻译任务无需推理，提速 60x+）
 
 output:
   page_separator: true      # 页面间插入 --- Page N ---

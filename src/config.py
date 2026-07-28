@@ -4,13 +4,21 @@
 """
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import yaml
 
+from dotenv import load_dotenv
+
 # 项目根目录
 PROJECT_ROOT = Path(__file__).parent.parent
+
+# 加载 .env 文件（如存在）
+_env_file = PROJECT_ROOT / ".env"
+if _env_file.exists():
+    load_dotenv(_env_file)
 
 # 默认配置文件路径
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
@@ -63,6 +71,7 @@ def get_config() -> Dict[str, Any]:
 def get(key: str, default: Any = None) -> Any:
     """
     获取配置项，支持点号分隔的嵌套键
+    支持环境变量替换: ${ENV_VAR} → os.environ[ENV_VAR]
     
     Args:
         key: 配置键，如 "ocr.api_base"
@@ -81,7 +90,24 @@ def get(key: str, default: Any = None) -> Any:
         else:
             return default
     
+    # 环境变量替换: ${VAR_NAME} → 实际值
+    if isinstance(value, str):
+        value = _resolve_env_vars(value)
+    
     return value
+
+
+def _resolve_env_vars(value: str) -> str:
+    """
+    解析字符串中的环境变量引用 ${VAR_NAME}
+    
+    如果环境变量存在，替换为实际值；否则保留原始字符串。
+    """
+    def _replace(match):
+        var_name = match.group(1)
+        return os.environ.get(var_name, match.group(0))
+    
+    return re.sub(r'\$\{(\w+)\}', _replace, value)
 
 
 def get_path(key: str) -> Path:

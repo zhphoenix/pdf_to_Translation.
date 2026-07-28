@@ -15,9 +15,25 @@ from tqdm import tqdm
 from . import config
 
 
+class TqdmLoggingHandler(logging.StreamHandler):
+    """
+    兼容 tqdm 的日志 Handler
+    通过 tqdm.write() 输出日志，避免与进度条的 \r 刷新冲突。
+    日志显示在进度条上方，进度条始终保持在最底行。
+    """
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm.write(msg, file=sys.stdout)
+        except Exception:
+            self.handleError(record)
+
+
 def setup_logger(name: str = "unlimited-ocr", level: int = logging.INFO) -> logging.Logger:
     """
     配置日志记录器，同时输出到终端和日志文件
+    终端输出使用 TqdmLoggingHandler，与进度条共存不冲突
     
     Args:
         name: 日志记录器名称
@@ -39,8 +55,8 @@ def setup_logger(name: str = "unlimited-ocr", level: int = logging.INFO) -> logg
         datefmt="%Y-%m-%d %H:%M:%S"
     )
     
-    # 终端输出
-    console_handler = logging.StreamHandler(sys.stdout)
+    # 终端输出（通过 tqdm.write，与进度条共存）
+    console_handler = TqdmLoggingHandler(sys.stdout)
     console_handler.setLevel(level)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
@@ -104,7 +120,11 @@ def get_image_mime_type(image_path: Path) -> str:
 
 def create_progress_bar(total: int, desc: str = "处理中") -> tqdm:
     """
-    创建进度条
+    创建进度条（兼容 IDE 内置终端和外部终端）
+    
+    - 输出到 stdout（IDE 终端可见）
+    - dynamic_ncols 自适应终端宽度
+    - position=0, leave=True 确保进度条固定显示
     
     Args:
         total: 总数
@@ -113,7 +133,17 @@ def create_progress_bar(total: int, desc: str = "处理中") -> tqdm:
     Returns:
         tqdm 进度条对象
     """
-    return tqdm(total=total, desc=desc, unit="页", ncols=100)
+    return tqdm(
+        total=total,
+        desc=desc,
+        unit="页",
+        file=sys.stdout,
+        position=0,
+        leave=True,
+        dynamic_ncols=True,    # 自适应终端宽度
+        mininterval=1,         # 最少 1 秒刷新
+        ascii=" =#",           # ASCII 进度字符（兼容所有终端）
+    )
 
 
 def ensure_dir(path: Path) -> Path:
