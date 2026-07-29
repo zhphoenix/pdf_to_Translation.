@@ -236,16 +236,7 @@ def process_single_pdf(
 TRANS_CONTAINER_NAME = "sisyphus"
 
 # 跳过页占位符文本前缀
-SKIP_PLACEHOLDER_PREFIX = "[图片页 - 已跳过]"
-
-
-def _count_text_elements(elements: List[OCRElement]) -> int:
-    """统计页面中有效文本元素数（排除页眉/页脚/页码）"""
-    skip_types = {"header", "footer", "page_number"}
-    return sum(
-        1 for e in elements
-        if e.text.strip() and e.type not in skip_types
-    )
+SKIP_PLACEHOLDER_PREFIX = "[已跳过]"
 
 
 def _make_placeholder_element(page_num: int, reason: str) -> OCRElement:
@@ -324,8 +315,7 @@ def step_ocr(pdf_files: List[Path], output_dir: Path, dpi: int = None):
     ensure_dir(output_dir)
 
     # 页面预检阈值
-    skip_enabled = config.get("page_filter.skip_image_pages", True)
-    min_ocr_elements = config.get("page_filter.min_ocr_elements", 3)
+    skip_enabled = config.get("page_filter.skip_front_pages", 2) > 0
     concurrency = max(1, config.get("ocr.concurrency", 2))
 
     if concurrency > 1:
@@ -356,19 +346,17 @@ def step_ocr(pdf_files: List[Path], output_dir: Path, dpi: int = None):
             pages_data: List[Optional[dict]] = [None] * total_pages
             ocr_tasks = []  # (page_idx, page_no) 需要 OCR 的页面
             skipped_count = 0
-
             for i in range(total_pages):
                 page_no = i + 1
                 analysis = page_analysis.get(i)
                 if analysis is not None and analysis.is_image_only:
                     logger.info(
-                        f"跳过第 {page_no} 页（图片页，{analysis.reason}，"
-                        f"文字字符数: {analysis.text_chars}）"
+                        f"跳过第 {page_no} 页（{analysis.reason}）"
                     )
                     pages_data[i] = {
                         "page": page_no,
                         "skipped": True,
-                        "reason": f"image-only page ({analysis.reason})",
+                        "reason": analysis.reason,
                         "elements": [_make_placeholder_element(page_no, analysis.reason).to_dict()],
                     }
                     skipped_count += 1
@@ -377,7 +365,6 @@ def step_ocr(pdf_files: List[Path], output_dir: Path, dpi: int = None):
 
             # ─── 第二阶段：分批预渲染 + 并发 OCR API + 每批保存 ───
             OCR_BATCH_SIZE = 10  # 每批处理页数，处理完保存并释放内存
-            low_value_count = 0
             progress = create_progress_bar(total_pages, f"OCR {pdf_name[:20]}")
             # 先更新已跳过页的进度
             progress.update(skipped_count)
@@ -398,18 +385,10 @@ def step_ocr(pdf_files: List[Path], output_dir: Path, dpi: int = None):
                             elements = []
                         # 即时后处理
                         elements = post_processor.process_page(elements)
-                        page_skipped = False
-                        page_reason = ""
-                        if skip_enabled and _count_text_elements(elements) < min_ocr_elements:
-                            page_skipped = True
-                            page_reason = f"low-value page ({_count_text_elements(elements)} text elements)"
-                            logger.info(f"第 {page_no} 页 OCR 内容过少，标记为低价值页")
-                            elements = [_make_placeholder_element(page_no, "low-value")]
-                            low_value_count += 1
                         pages_data[page_idx] = {
                             "page": page_no,
-                            "skipped": page_skipped,
-                            "reason": page_reason,
+                            "skipped": False,
+                            "reason": "",
                             "elements": [e.to_dict() for e in elements],
                         }
                         progress.update(1)
@@ -456,18 +435,10 @@ def step_ocr(pdf_files: List[Path], output_dir: Path, dpi: int = None):
                         page_no = page_idx + 1
                         elements = batch_results.get(page_idx, [])
                         elements = post_processor.process_page(elements)
-                        page_skipped = False
-                        page_reason = ""
-                        if skip_enabled and _count_text_elements(elements) < min_ocr_elements:
-                            page_skipped = True
-                            page_reason = f"low-value page ({_count_text_elements(elements)} text elements)"
-                            logger.info(f"第 {page_no} 页 OCR 内容过少，标记为低价值页")
-                            elements = [_make_placeholder_element(page_no, "low-value")]
-                            low_value_count += 1
                         pages_data[page_idx] = {
                             "page": page_no,
-                            "skipped": page_skipped,
-                            "reason": page_reason,
+                            "skipped": False,
+                            "reason": "",
                             "elements": [e.to_dict() for e in elements],
                         }
 
@@ -491,8 +462,8 @@ def step_ocr(pdf_files: List[Path], output_dir: Path, dpi: int = None):
             elapsed = time.time() - start_time
             total_elem = sum(len(p["elements"]) for p in pages_data)
             logger.info(
-                f"  完成: {total_elem} 个元素, 跳过 {skipped_count} 图片页"
-                f" + {low_value_count} 低价值页, 耗时 {elapsed:.1f}s → {json_file.name}"
+                f"  完成: {total_elem} 个元素, 跳过 {skipped_count} 封面页"
+                f", 耗时 {elapsed:.1f}s → {json_file.name}"
             )
             success += 1
 

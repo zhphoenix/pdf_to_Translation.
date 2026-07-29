@@ -1,85 +1,46 @@
-# Unlimited-OCR 扫描版 PDF 转 Markdown 配置文件
+# PDF 转 Markdown 配置文件
 
+# PaddleOCR-VL VLM 推理服务
+# 服务: paddleocr genai_server (端口 8118)
+# 模型: PaddleOCR-VL-1.6-0.9B (vLLM 后端，OpenAI Compatible API)
 ocr:
-  api_base: "http://localhost:8000/v1"
-  model: "unlimited-ocr"          # 对应 vLLM --served-model-name
-  timeout: 300                    # vLLM 长文档可能需要更长时间
-  max_retries: 3
-  concurrency: 3                  # 客户端并发请求数（利用 vLLM continuous batching）
-  skip_special_tokens: false      # vLLM 必需：保留 <|det|> 标记
-  ngram_size: 15                  # 防重复 n-gram 大小（原35→15，更早拦截短重复模式）
-  ngram_window_single: 128        # 单页窗口（模型滑动窗口硬限制）
-  ngram_window_multi: 1024        # 多页窗口
-  repetition_penalty: 1.1         # vLLM 原生重复惩罚（>1.0 抑制重复，1.0=无惩罚）
-  temperature: 0.1                # 微调采样温度（0=greedy易陷入重复陷阱，0.1轻微随机性）
+  engine: "paddleocr"
+  concurrency: 3                  # 客户端并发请求数
+
+paddleocr:
+  api_base: "http://localhost:8118/v1"    # VLM 推理服务地址
+  model: "PaddleOCR-VL-1.6-0.9B"         # 模型名称
+  timeout: 300                            # 请求超时（秒）
+  max_retries: 3                          # 最大重试次数
+  temperature: 0.0                        # 采样温度（0=greedy）
+  max_tokens: 8192                        # 最大输出 token
 
 pdf:
   dpi: 300
-  format: "png"               # 磁盘保存格式（pdf_to_images 用）
-  ocr_format: "jpeg"          # OCR 传输格式（jpeg 编码快+体积小，png 无损）
+  format: "png"               # 磁盘保存格式
+  ocr_format: "jpeg"          # OCR 传输格式
 
-# 页面预检：OCR 前自动跳过以图片为主的页面（全页照片/广告图/插图）
+# 页面过滤：跳过封面
 page_filter:
-  skip_image_pages: true        # 总开关
-  min_text_chars: 50            # 文字层字符数低于此值才可能被判定为图片页
-  body_text_threshold: 1500     # 文字层字符数超过此值→必为内容页（强保护）
-  image_coverage_threshold: 0.6 # 嵌入图片面积占比中等阈值
-  high_image_coverage: 0.85     # 嵌入图片面积占比高阈值（广告页判定）
-  color_threshold: 100          # 颜色丰富度阈值（降采样后不同颜色数，区分照片与图形）
-  ink_coverage_min: 0.08        # 墨迹覆盖率下限（过低=近空白页）
-  ink_coverage_max: 0.75        # 墨迹覆盖率上限（过高=文字密集/深色底）
-  render_dpi: 72                # 颜色分析用的渲染 DPI（低值省内存）
-  min_ocr_elements: 3           # OCR 后有效文本元素少于此数→标记为低价值页
+  skip_front_pages: 2              # 跳过前 N 页（封面/内封）
 
-postprocess:
-  remove_headers: true
-  remove_footers: true
-  remove_page_numbers: true
-  remove_tables: true          # 过滤 HTML 表格（OCR 表格质量差，过滤后不进入翻译）
-  remove_ads: true
-  merge_broken_lines: true
-  merge_broken_words: true
-  header_patterns: []       # 用户自定义页眉正则
-  footer_patterns: []       # 用户自定义页脚正则
-  ad_patterns:              # 广告关键词
-    - "Subscribe now"
-    - "Advertisement"
-  # OCR 输出质量过滤（检测重复退化和幻觉文本）
-  quality_filter:
-    enabled: true
-    repeat_min_length: 500         # 文本超过此长度才检测重复（降低以捕获短文本重复）
-    repeat_max_ratio: 0.5          # 15-gram 唯一比低于此值判定为重复退化
-    repeat_ngram_size: 15          # 重复检测的 n-gram 大小
-    sentence_repeat_threshold: 3   # 同一句子出现 N 次触发截断
-    dedup_similarity_threshold: 0.85  # 元素去重相似度阈值（Jaccard 系数）
-    hallucination_prefixes:        # OCR 模型幻觉特征（文本开头匹配）
-      - "The Ground Truth image displays"
-      - "The image contains no text"
-      - "According to Rule"
-      - "The following table provides"    # OCR 元数据注释泄漏
-      - "The second line is a stylistic"  # OCR 排版分析泄漏
-      - "The English text in the source image is a single"  # OCR 图像描述泄漏
-      - "The best answer in this case is"     # 无关问答文本泄漏
-
-# 翻译服务（本地推理模型 Qwythos-9B-Claude-Mythos）
-# 推理模型特性：响应包含 reasoning_content（思考过程）+ content（译文）
-# 容器由 /mnt/e/ai-platform/sisyphus/ 独立管理，不在此项目中
+# 翻译服务（sisyphus，由外部项目管理）
 translation:
-  enabled: false            # 默认关闭
+  enabled: false
   api_base: "http://localhost:8080/v1"
   api_key: "not-needed"
   model: "sisyphus"
   target_language: "简体中文"
-  timeout: 300              # 长文本翻译需要更多时间
-  batch_size: 3             # 每次翻译的元素数（减小以避免模型截断）
-  max_tokens: 4096          # 关闭推理后仅需译文 token（原 16384）
-  temperature: 0.3          # 低温度保证翻译稳定性
-  repeat_penalty: 1.1       # 重复惩罚（仅本地模型生效）
-  disable_thinking: true    # 关闭推理思考（翻译任务无需推理，提速 60x+）
+  timeout: 300
+  batch_size: 3
+  max_tokens: 4096
+  temperature: 0.3
+  repeat_penalty: 1.1
+  disable_thinking: true
 
 output:
-  page_separator: true      # 页面间插入 --- Page N ---
-  single_file: true         # 整本书输出为单个 .md
+  page_separator: true
+  single_file: true
 
 paths:
   input_dir: "input"

@@ -88,14 +88,17 @@ log "═════════════════════════
 TRANS_DIR="${PROJECT_DIR}/translation"
 if [ -d "$TRANS_DIR" ]; then
     existing_trans=()
-    # 收集输入 PDF 对应的已有翻译文件
+    # 收集输入 PDF 对应的已有翻译文件（精确匹配，避免前缀重叠误判）
     while IFS= read -r -d '' pdf; do
         base="$(basename "$pdf" .pdf)"
-        for ext in md txt; do
-            for f in "${TRANS_DIR}/${base}"*.${ext}; do
-                [ -f "$f" ] && existing_trans+=("$f")
-            done
-        done
+        # Markdown 模式输出: {base}.md
+        if [ -f "${TRANS_DIR}/${base}.md" ]; then
+            existing_trans+=("${TRANS_DIR}/${base}.md")
+        fi
+        # Text 模式输出: {base}_translated.txt
+        if [ -f "${TRANS_DIR}/${base}_translated.txt" ]; then
+            existing_trans+=("${TRANS_DIR}/${base}_translated.txt")
+        fi
     done < <(find "$INPUT" -maxdepth 1 -name '*.pdf' -print0 2>/dev/null || printf '%s\0' "$INPUT")
 
     if [ ${#existing_trans[@]} -gt 0 ]; then

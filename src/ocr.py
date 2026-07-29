@@ -1,5 +1,75 @@
 """
 OCR 模块
+OCRElement 数据结构 + 引擎工厂
+"""
+
+from dataclasses import dataclass
+from typing import Tuple
+
+
+@dataclass
+class OCRElement:
+    """OCR 结构化元素"""
+    type: str                         # title, heading, text, list_item, caption, quote
+    bbox: Tuple[int, int, int, int]   # (x1, y1, x2, y2)
+    text: str                         # 文本内容
+    page: int = 0                     # 所属页码
+
+    @property
+    def x1(self) -> int:
+        return self.bbox[0]
+
+    @property
+    def y1(self) -> int:
+        return self.bbox[1]
+
+    @property
+    def x2(self) -> int:
+        return self.bbox[2]
+
+    @property
+    def y2(self) -> int:
+        return self.bbox[3]
+
+    @property
+    def width(self) -> int:
+        return self.x2 - self.x1
+
+    @property
+    def height(self) -> int:
+        return self.y2 - self.y1
+
+    def to_dict(self) -> dict:
+        """转为 JSON 可序列化字典"""
+        return {
+            "type": self.type,
+            "bbox": list(self.bbox),
+            "text": self.text,
+            "page": self.page,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "OCRElement":
+        """从字典反序列化"""
+        return cls(
+            type=d["type"],
+            bbox=tuple(d["bbox"]),
+            text=d["text"],
+            page=d.get("page", 0)
+        )
+
+
+def create_ocr_engine():
+    """
+    创建 OCR 引擎实例（PaddleOCR-VL VLM）
+
+    Returns:
+        PaddleOCREngine 实例
+    """
+    from .paddleocr_engine import create_paddleocr_engine
+    return create_paddleocr_engine()
+"""
+OCR 模块
 调用 Unlimited-OCR vLLM API（OpenAI Compatible API）进行图片文字识别
 输出结构化 OCR 结果（类型 + 坐标 + 文本）
 
@@ -362,11 +432,21 @@ class OCREngine:
                     raise
 
 
-def create_ocr_engine() -> OCREngine:
+def create_ocr_engine():
     """
     创建 OCR 引擎实例
 
+    根据配置 ocr.engine 选择引擎:
+    - "unlimited-ocr": Unlimited-OCR vLLM API (默认)
+    - "paddleocr": PaddleOCR-VL 全流水线服务
+
     Returns:
-        OCREngine 实例
+        OCR 引擎实例（OCREngine 或 PaddleOCREngine）
     """
-    return OCREngine()
+    engine_type = config.get("ocr.engine", "unlimited-ocr")
+
+    if engine_type == "paddleocr":
+        from .paddleocr_engine import create_paddleocr_engine
+        return create_paddleocr_engine()
+    else:
+        return OCREngine()

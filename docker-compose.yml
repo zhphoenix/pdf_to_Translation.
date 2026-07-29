@@ -1,47 +1,26 @@
-# =============================================================================
-# Unlimited-OCR 扫描版 PDF 转 Markdown - 服务编排
-# =============================================================================
+# PDF 转 Markdown - 服务编排
 #
-# 架构说明:
-#   本项目仅管理 OCR 服务（vLLM + Unlimited-OCR-NVFP4）
-#   翻译服务（sisyphus）由 ai-platform 独立管理，不在此项目中
+# PaddleOCR-VL VLM 推理: http://localhost:8118 (端口 8118)
+# 翻译服务: http://localhost:8080/v1 (外部: /mnt/e/ai-platform/sisyphus/)
 #
-# 服务依赖:
-#   OCR:    http://localhost:8000/v1  (本文件管理)
-#   翻译:   http://localhost:8080/v1  (外部: /mnt/e/ai-platform/sisyphus/)
-#
-# 使用方式:
-#   启动 OCR:     docker compose up -d
-#   查看日志:     docker compose logs -f ocr
-#   停止 OCR:     docker compose stop
-#   检查状态:     curl -sf http://localhost:8000/health
-#
-# 翻译服务管理 (独立项目):
-#   启动:         cd /mnt/e/ai-platform/sisyphus && docker compose up -d
-#   检查状态:     curl -sf http://localhost:8080/health
-#
-# 显存注意:
-#   RTX 5060 Ti 16GB 不足以同时运行 OCR 和翻译模型
-#   如需同时运行，请先停止一个服务
-# =============================================================================
+# 显存注意: RTX 5060 Ti 16GB 不足以同时运行 OCR 和翻译
 
 services:
-  # ---------------------------------------------------------------------------
-  # OCR 服务: vLLM + Unlimited-OCR-NVFP4
-  # 端口: 8000
-  # 模型: /mnt/g/models/OCR/Unlimited-OCR-NVFP4
-  # ---------------------------------------------------------------------------
-  ocr:
-    image: vllm/vllm-openai:unlimited-ocr
-    container_name: ocr
+  # PaddleOCR-VL VLM 推理服务 (端口 8118)
+  # 模型: PaddleOCR-VL-1.6-0.9B (vLLM 后端)
+  paddleocr-genai:
+    image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu
+    container_name: paddleocr-genai
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "8118:8118"
     volumes:
-      - /mnt/g/models/OCR/Unlimited-OCR-NVFP4:/model:ro
-    networks:
-      - ocr-net
-    ipc: host  # vLLM 需要共享内存
+      - /mnt/g/models/OCR/PaddleOCR-VL-1.6:/home/paddleocr/.paddlex/official_models/PaddleOCR-VL-1.6
+      - ./paddlex_cache/temp:/home/paddleocr/.paddlex/temp
+      - ./paddlex_cache/func_ret:/home/paddleocr/.paddlex/func_ret
+      - ./paddlex_cache/locks:/home/paddleocr/.paddlex/locks
+    environment:
+      - PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
     deploy:
       resources:
         reservations:
@@ -50,33 +29,24 @@ services:
               count: all
               capabilities: [gpu]
     command:
-      - /model
-      - --served-model-name
-      - unlimited-ocr
-      - --trust-remote-code
-      - --logits_processors
-      - "vllm.model_executor.models.unlimited_ocr:NGramPerReqLogitsProcessor"
-      - --no-enable-prefix-caching
-      - --mm-processor-cache-gb
-      - "0"
+      - paddleocr
+      - genai_server
+      - --model_name
+      - PaddleOCR-VL-1.6-0.9B
       - --host
       - 0.0.0.0
       - --port
-      - "8000"
-      - --max-model-len
-      - "32768"
+      - "8118"
+      - --backend
+      - vllm
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:8118/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 120s  # vLLM 模型加载需要时间
+      start_period: 180s
     logging:
       driver: json-file
       options:
         max-size: "50m"
         max-file: "3"
-
-networks:
-  ocr-net:
-    driver: bridge
