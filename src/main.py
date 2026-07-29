@@ -399,7 +399,7 @@ def step_ocr(pdf_files: List[Path], output_dir: Path, dpi: int = None, max_pages
                 completed_count = 0
 
         # 已有进度已覆盖目标页数，跳过
-        if existing_pages is not None and completed_count >= max_pages:
+        if existing_pages is not None and max_pages is not None and completed_count >= max_pages:
             logger.info(f"跳过已存在: {json_file.name}（{completed_count} 页已完成）")
             success += 1
             continue
@@ -461,8 +461,9 @@ def step_ocr(pdf_files: List[Path], output_dir: Path, dpi: int = None, max_pages
             # ─── 第二阶段：分批预渲染 + 并发 OCR API + 每批保存 ───
             OCR_BATCH_SIZE = 10  # 每批处理页数，处理完保存并释放内存
             progress = create_progress_bar(total_pages, f"OCR {pdf_name[:20]}")
-            # 先更新已跳过页的进度
-            progress.update(skipped_count)
+            # 初始进度：已完成页（断点续传）+ 本轮跳过页（prescan）
+            handled_count = sum(1 for p in pages_data if p is not None)
+            progress.update(handled_count)
 
             # 分批处理：每批渲染 → OCR → 后处理 → 保存 → 释放
             batch_start = 0

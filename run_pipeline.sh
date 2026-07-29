@@ -38,6 +38,11 @@ cleanup() {
         echo -e "\033[1;33m[$(date '+%H:%M:%S')]\033[0m 停止 OCR 容器: ${OCR_CONTAINER}"
         docker stop "${OCR_CONTAINER}" > /dev/null 2>&1 || true
     fi
+    # 停止翻译容器（如果正在运行）
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${TRANS_CONTAINER}$"; then
+        echo -e "\033[1;33m[$(date '+%H:%M:%S')]\033[0m 停止翻译容器: ${TRANS_CONTAINER}"
+        docker stop "${TRANS_CONTAINER}" > /dev/null 2>&1 || true
+    fi
     echo -e "\033[1;33m[$(date '+%H:%M:%S')]\033[0m 容器清理完成"
 }
 trap cleanup EXIT INT TERM
@@ -68,10 +73,11 @@ err() { echo -e "\n\033[1;31m[ERROR]\033[0m $1" >&2; }
 wait_for_service() {
     local url="$1"
     local name="$2"
-    local max_wait=180
+    local max_wait="${3:-180}"
     local waited=0
     log "等待 ${name} 就绪 (${url})..."
-    while ! curl -s "${url}" > /dev/null 2>&1; do
+    # -sf: 连接失败或 HTTP 错误码(4xx/5xx)均视为未就绪
+    while ! curl -sf "${url}" > /dev/null 2>&1; do
         sleep 2
         waited=$((waited + 2))
         if [ $waited -ge $max_wait ]; then
@@ -139,7 +145,7 @@ else
     fi
 
     # 等待 OCR 服务就绪
-    wait_for_service "http://localhost:8000/health" "vLLM OCR"
+    wait_for_service "http://localhost:8118/health" "PaddleOCR-VL"
 
     # 运行 OCR 步骤
     log "执行 OCR: ${INPUT} → ${OUTPUT_DIR}/"
@@ -167,7 +173,7 @@ if ! docker ps --format '{{.Names}}' | grep -q "^${TRANS_CONTAINER}$"; then
 fi
 
 # 等待翻译服务就绪（模型加载约需 2 分钟）
-wait_for_service "http://localhost:8080/health" "llama.cpp 翻译"
+wait_for_service "http://localhost:8080/health" "llama.cpp 翻译" 300
 
 # 运行翻译步骤
 TRANSLATE_ARGS="--step translate"

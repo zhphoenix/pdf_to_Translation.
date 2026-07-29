@@ -98,30 +98,44 @@ graph TD
 
 每页 OCR 完成后，基于输出特征进行内容分析，作为兜底过滤。
 
-**过滤规则**（基于《经济学人》实测数据建立）：
+#### 过滤规则
 
-| 规则 | 条件 | 命中示例 |
-|------|------|---------|
-| 封面检测 | 元素数 < 4 **且** 文本重复率 ≥ 80% | 封面标题被 VLM 拆分为多个相同文本块 |
-| 广告检测 | 元素数 < 4 **且** 总文本 ≤ 250 字符 | 纯广告页（如 Oracle 整版广告） |
+| # | 规则名称 | 判定条件 | 过滤原因 | config 参数 |
+|---|---------|---------|---------|-------------|
+| 1 | 封面检测 | 元素数 < `min_elements` **且** 文本重复率 ≥ `max_repeat_ratio` | 封面/扉页无正文内容（VLM 将封面标题拆分为多个相同文本块） | `min_elements: 4`<br>`max_repeat_ratio: 0.80` |
+| 2 | 少元素广告 | 元素数 < `min_elements` **且** 总文本长度 < `max_text_len` | 整页广告（如品牌宣传页、产品广告） | `min_elements: 4`<br>`max_text_len: 2000` |
+| 3 | 碎片化广告 | 元素数 ≥ `frag_ad_min_elements` **且** ≥ `frag_ad_short_ratio` 的元素文本长度 < `frag_ad_short_len` | 碎片化短文本广告（如活动推广页、课程宣传页） | `frag_ad_min_elements: 6`<br>`frag_ad_short_len: 100`<br>`frag_ad_short_ratio: 0.80` |
+| 4 | 分类广告 | 联系方式模式（`Tel:`/`Email:`/`www.`/`http://`）出现 ≥ `classified_ad_min_contacts` 次 | 分类广告页（房产/招聘/法律免责声明等多个独立广告） | `classified_ad_min_contacts: 3` |
+| 5 | 数据表格页 | 元素数 < `max_table_elements` **且** 总文本 ≥ `min_table_text_len` **且** 行重复率 ≥ `min_line_repeat_ratio` | 纯数据表格（表头被重复数百次，翻译无意义） | `max_table_elements: 5`<br>`min_table_text_len: 5000`<br>`min_line_repeat_ratio: 0.50` |
 
-**实测特征对比**：
+**规则执行顺序**：碎片化广告 → 分类广告 → 封面/少元素广告 → 表格页。规则 1-2 仅在元素数 < `min_elements` 时触发，规则 3-4 在元素数充足时提前检测特定广告类型。
 
-| 页面类型 | 图片大小 | 元素数 | 文本长度 | 文本重复率 |
-|---------|---------|--------|---------|-----------|
-| 封面（第1页） | 1821 KB | 3 | 435 字符 | 100% |
-| 广告（第2页） | 409 KB | 3 | 179 字符 | 0% |
-| 目录（第3页） | 728 KB | 10 | 1594 字符 | ~10% |
-| 正文（第5页） | 1187 KB | 18 | 6335 字符 | 0% |
+#### 配置示例
 
-阈值可通过 `config.yaml` 覆盖：
+所有阈值可在 `config.yaml` 的 `page_filter` 段调整：
 
 ```yaml
 page_filter:
-  skip_front_pages: 2       # 预扫描：跳过前 N 页
-  min_elements: 4           # 后分析：元素数低于此值视为可疑
-  max_text_len: 250         # 后分析：总文本低于此值视为可疑
-  max_repeat_ratio: 0.80    # 后分析：文本重复率高于此值判定为封面
+  # 预扫描
+  skip_front_pages: 2              # 跳过前 N 页（封面/内封）
+  
+  # 规则 1 & 2：封面和少元素广告
+  min_elements: 4                  # 元素数低于此值进入规则 1/2 检测
+  max_repeat_ratio: 0.80           # 文本重复率阈值（封面）
+  max_text_len: 2000               # 总文本长度阈值（广告）
+  
+  # 规则 3：碎片化广告
+  frag_ad_min_elements: 6          # 最少元素数
+  frag_ad_short_len: 100           # 短元素文字长度上限
+  frag_ad_short_ratio: 0.80        # 短元素占比阈值
+  
+  # 规则 4：分类广告
+  classified_ad_min_contacts: 3    # 联系方式模式最少出现次数
+  
+  # 规则 5：数据表格页
+  max_table_elements: 5            # 表格页元素上限
+  min_table_text_len: 5000         # 表格页文本下限
+  min_line_repeat_ratio: 0.50      # 行重复率阈值
 ```
 
 ## 4. 断点续传机制
@@ -282,3 +296,8 @@ OCR/
 ├── run_pipeline.sh     # 流水线脚本（含容器切换）
 └── requirements.txt    # Python 依赖
 ```
+
+运行完整流水线
+cd /mnt/e/OCR && ./run_pipeline.sh input/
+rm -f /mnt/e/OCR/translation/* /mnt/e/OCR/output/*.translate.json
+cd /mnt/e/OCR && ./run_pipeline.sh input/ --skip-ocr

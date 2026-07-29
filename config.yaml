@@ -20,9 +20,19 @@ pdf:
   format: "png"               # 磁盘保存格式
   ocr_format: "jpeg"          # OCR 传输格式
 
-# 页面过滤：跳过封面
+# 页面过滤
 page_filter:
   skip_front_pages: 2              # 跳过前 N 页（封面/内封）
+  min_elements: 4                  # 元素数低于此值视为可疑
+  max_text_len: 2000               # 总文本低于此值判定为广告
+  max_repeat_ratio: 0.80           # 文本重复率高于此值判定为封面
+  max_table_elements: 5            # 纯表格页元素上限
+  min_table_text_len: 5000         # 纯表格页文本下限
+  min_line_repeat_ratio: 0.50      # 纯表格页行重复率下限
+  frag_ad_min_elements: 6          # 碎片化广告：最少元素数
+  frag_ad_short_len: 100           # 碎片化广告：元素文字长度上限
+  frag_ad_short_ratio: 0.80        # 碎片化广告：短元素占比下限
+  classified_ad_min_contacts: 3    # 分类广告：联系方式模式最少数量
 
 # 翻译服务（sisyphus，由外部项目管理）
 translation:
