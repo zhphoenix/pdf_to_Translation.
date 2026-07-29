@@ -30,7 +30,7 @@ class TqdmLoggingHandler(logging.StreamHandler):
             self.handleError(record)
 
 
-def setup_logger(name: str = "unlimited-ocr", level: int = logging.INFO) -> logging.Logger:
+def setup_logger(name: str = "paddleocr", level: int = logging.INFO) -> logging.Logger:
     """
     配置日志记录器，同时输出到终端和日志文件
     终端输出使用 TqdmLoggingHandler，与进度条共存不冲突
@@ -78,7 +78,7 @@ def setup_logger(name: str = "unlimited-ocr", level: int = logging.INFO) -> logg
 
 def get_logger() -> logging.Logger:
     """获取全局日志记录器"""
-    return logging.getLogger("unlimited-ocr")
+    return logging.getLogger("paddleocr")
 
 
 def encode_image_to_base64(image_path: Path) -> str:

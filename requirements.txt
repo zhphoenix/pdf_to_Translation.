@@ -1,4 +1,4 @@
-# Unlimited-OCR 扫描版 PDF 转 Markdown
+# PaddleOCR 扫描版 PDF 转 Markdown
 # Python 依赖
 
 # PDF 解析

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unlimited-OCR 扫描版 PDF 转 Markdown
+PaddleOCR 扫描版 PDF 转 Markdown
 主流水线入口
 
 流程: PDF → 图片 → OCR(结构化) → 后处理 → 翻译(可选) → Markdown
@@ -15,6 +15,7 @@ Unlimited-OCR 扫描版 PDF 转 Markdown
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -26,10 +27,34 @@ from . import config
 from .config import PROJECT_ROOT
 from .pdf2image import pdf_to_images, get_page_count, extract_page_image
 from .ocr import create_ocr_engine, OCRElement
-from .page_filter import prescan_pages
+from .page_filter import prescan_pages, analyze_page_content
+
+
+def _atomic_write_json(path: Path, data) -> None:
+    """
+    原子写入 JSON：先写临时文件，再原子重命名。
+    防止写入过程中断导致文件损坏。
+    """
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp_path, path)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """
+    原子写入文本文件：先写临时文件，再原子重命名。
+    防止写入过程中断导致产生不完整的输出。
+    """
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp_path, path)
+
 from .postprocess import create_post_processor
 from .markdown import create_markdown_generator
 from .translate import create_translator
+from .notify import Notifier
 from .utils import (
     setup_logger,
     get_logger,
@@ -43,7 +68,7 @@ from .utils import (
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(
-        description="Unlimited-OCR 扫描版 PDF 转 Markdown",
+        description="PaddleOCR 扫描版 PDF 转 Markdown",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -108,6 +133,13 @@ def parse_args():
         "--no-translate",
         action="store_true",
         help="禁用翻译"
+    )
+
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=None,
+        help="限制处理的最大页数（测试用）"
     )
 
     parser.add_argument(
@@ -239,6 +271,24 @@ TRANS_CONTAINER_NAME = "sisyphus"
 SKIP_PLACEHOLDER_PREFIX = "[已跳过]"
 
 
+def _parse_md_page_numbers(md_path: Path) -> int:
+    """
+    解析 Markdown 文件中的 'Page N' 标记，返回已翻译的最大页码。
+    用于翻译断点续传检测。
+    """
+    import re
+    max_page = 0
+    try:
+        with open(md_path, "r", encoding="utf-8") as f:
+            for line in f:
+                m = re.match(r"^Page\s+(\d+)", line.strip())
+                if m:
+                    max_page = max(max_page, int(m.group(1)))
+    except Exception:
+        pass
+    return max_page
+
+
 def _make_placeholder_element(page_num: int, reason: str) -> OCRElement:
     """为跳过/低价值页生成占位元素，保持页码连续"""
     if reason.startswith("low-value"):
@@ -293,7 +343,7 @@ def _ocr_api_only(ocr_engine, image_bytes, page_no):
     return ocr_engine.ocr_image_bytes(image_bytes, page_num=page_no)
 
 
-def step_ocr(pdf_files: List[Path], output_dir: Path, dpi: int = None):
+def step_ocr(pdf_files: List[Path], output_dir: Path, dpi: int = None, max_pages: int = None):
     """
     第一步：仅 OCR + 后处理，保存中间 JSON
 
@@ -306,6 +356,10 @@ def step_ocr(pdf_files: List[Path], output_dir: Path, dpi: int = None):
     logger.info("=" * 60)
     logger.info("[步骤 1/2] OCR 识别 + 后处理")
     logger.info("=" * 60)
+
+    # 初始化通知器
+    notifier = Notifier(output_dir)
+    notifier.notify_step_start("ocr", total_files=len(pdf_files))
 
     # 检查翻译模型是否占用显存
     _ensure_translation_stopped()
@@ -326,9 +380,27 @@ def step_ocr(pdf_files: List[Path], output_dir: Path, dpi: int = None):
         pdf_name = pdf_path.stem
         json_file = output_dir / f"{sanitize_filename(pdf_name)}.ocr.json"
 
-        # 跳过已存在的 JSON（支持断点续传）
+        # ─── 断点续传：加载已有 OCR 进度 ───
+        existing_pages = None
+        completed_count = 0
         if json_file.exists():
-            logger.info(f"跳过已存在: {json_file.name}")
+            try:
+                with open(json_file, "r", encoding="utf-8") as f:
+                    existing_data = json.load(f)
+                existing_pages = existing_data.get("pages", [])
+                completed_count = sum(1 for p in existing_pages if p is not None)
+                if completed_count > 0:
+                    logger.info(
+                        f"检测到已有 OCR 进度: {completed_count} 页已完成"
+                    )
+            except Exception as e:
+                logger.warning(f"已有 JSON 加载失败，从头开始: {e}")
+                existing_pages = None
+                completed_count = 0
+
+        # 已有进度已覆盖目标页数，跳过
+        if existing_pages is not None and completed_count >= max_pages:
+            logger.info(f"跳过已存在: {json_file.name}（{completed_count} 页已完成）")
             success += 1
             continue
 
@@ -336,23 +408,46 @@ def step_ocr(pdf_files: List[Path], output_dir: Path, dpi: int = None):
         start_time = time.time()
 
         try:
-            total_pages = get_page_count(pdf_path)
+            actual_total_pages = get_page_count(pdf_path)
+            total_pages = actual_total_pages
+            if max_pages and total_pages > max_pages:
+                logger.info(f"限制处理页数: {total_pages} → {max_pages}")
+                total_pages = max_pages
+
+            # 合并已有进度
+            if existing_pages is not None:
+                pages_data = existing_pages
+                if len(pages_data) < total_pages:
+                    pages_data.extend([None] * (total_pages - len(pages_data)))
+                # 过滤已完成页面的 OCR 任务
+                ocr_tasks = [
+                    (i, i + 1) for i in range(total_pages)
+                    if pages_data[i] is None
+                ]
+                logger.info(
+                    f"断点续传: 从第 {completed_count + 1} 页继续"
+                    f"（{len(ocr_tasks)} 页待处理）"
+                )
+            else:
+                pages_data = [None] * total_pages
+                ocr_tasks = None  # 标记：后续正常初始化
 
             # 页面预检：识别图片页（OCR 前，节省 GPU）
             page_analysis = prescan_pages(pdf_path) if skip_enabled else {}
 
             # ─── 第一阶段：分类页面 ───
-            # pages_data[i] 预填充跳过页，OCR 页留 None 待填
-            pages_data: List[Optional[dict]] = [None] * total_pages
-            ocr_tasks = []  # (page_idx, page_no) 需要 OCR 的页面
+            if ocr_tasks is None:
+                # 首次处理：预填充跳过页，OCR 页留 None 待填
+                ocr_tasks = []
             skipped_count = 0
             for i in range(total_pages):
                 page_no = i + 1
                 analysis = page_analysis.get(i)
                 if analysis is not None and analysis.is_image_only:
-                    logger.info(
-                        f"跳过第 {page_no} 页（{analysis.reason}）"
-                    )
+                    if pages_data[i] is None:  # 仅首次填充时记录日志
+                        logger.info(
+                            f"跳过第 {page_no} 页（{analysis.reason}）"
+                        )
                     pages_data[i] = {
                         "page": page_no,
                         "skipped": True,
@@ -385,12 +480,24 @@ def step_ocr(pdf_files: List[Path], output_dir: Path, dpi: int = None):
                             elements = []
                         # 即时后处理
                         elements = post_processor.process_page(elements)
-                        pages_data[page_idx] = {
-                            "page": page_no,
-                            "skipped": False,
-                            "reason": "",
-                            "elements": [e.to_dict() for e in elements],
-                        }
+                        # OCR 后内容分析：检测封面/广告页
+                        filter_result = analyze_page_content(elements)
+                        if filter_result:
+                            reason, _ = filter_result
+                            logger.info(f"  第 {page_no} 页过滤: {reason}")
+                            pages_data[page_idx] = {
+                                "page": page_no,
+                                "skipped": True,
+                                "reason": reason,
+                                "elements": [_make_placeholder_element(page_no, reason).to_dict()],
+                            }
+                        else:
+                            pages_data[page_idx] = {
+                                "page": page_no,
+                                "skipped": False,
+                                "reason": "",
+                                "elements": [e.to_dict() for e in elements],
+                            }
                         progress.update(1)
                 else:
                     # 并发：仅预渲染当前批次
@@ -435,12 +542,24 @@ def step_ocr(pdf_files: List[Path], output_dir: Path, dpi: int = None):
                         page_no = page_idx + 1
                         elements = batch_results.get(page_idx, [])
                         elements = post_processor.process_page(elements)
-                        pages_data[page_idx] = {
-                            "page": page_no,
-                            "skipped": False,
-                            "reason": "",
-                            "elements": [e.to_dict() for e in elements],
-                        }
+                        # OCR 后内容分析：检测封面/广告页
+                        filter_result = analyze_page_content(elements)
+                        if filter_result:
+                            reason, _ = filter_result
+                            logger.info(f"  第 {page_no} 页过滤: {reason}")
+                            pages_data[page_idx] = {
+                                "page": page_no,
+                                "skipped": True,
+                                "reason": reason,
+                                "elements": [_make_placeholder_element(page_no, reason).to_dict()],
+                            }
+                        else:
+                            pages_data[page_idx] = {
+                                "page": page_no,
+                                "skipped": False,
+                                "reason": "",
+                                "elements": [e.to_dict() for e in elements],
+                            }
 
                     # 释放批次结果内存
                     batch_results.clear()
@@ -449,10 +568,12 @@ def step_ocr(pdf_files: List[Path], output_dir: Path, dpi: int = None):
                 interim_data = {
                     "source": str(pdf_path),
                     "total_pages": total_pages,
+                    "actual_total_pages": actual_total_pages,
+                    "page_range_start": 1,
+                    "page_range_end": total_pages,
                     "pages": pages_data,
                 }
-                with open(json_file, "w", encoding="utf-8") as f:
-                    json.dump(interim_data, f, ensure_ascii=False, indent=2)
+                _atomic_write_json(json_file, interim_data)
                 logger.debug(f"  中间保存: 已完成至第 {batch_end_page} 页")
 
                 batch_start += OCR_BATCH_SIZE
@@ -465,12 +586,18 @@ def step_ocr(pdf_files: List[Path], output_dir: Path, dpi: int = None):
                 f"  完成: {total_elem} 个元素, 跳过 {skipped_count} 封面页"
                 f", 耗时 {elapsed:.1f}s → {json_file.name}"
             )
+            # 发送单文件完成通知
+            notifier.notify_step_progress("ocr", current=success + 1, total=len(pdf_files),
+                                          file=pdf_path.name, elements=total_elem,
+                                          elapsed=elapsed, output=str(json_file))
             success += 1
 
         except Exception as e:
             logger.error(f"  失败: {pdf_path.name}, {e}")
+            notifier.notify_step_error("ocr", str(e), file=pdf_path.name)
 
     logger.info(f"OCR 步骤完成: {success}/{len(pdf_files)} 个文件")
+    notifier.notify_step_done("ocr", success=success, total=len(pdf_files))
     return success
 
 
@@ -491,6 +618,10 @@ def step_translate(input_dir: Path, output_dir: Path, output_format: str = "mark
     logger.info("[步骤 2/2] 翻译 + 输出")
     logger.info("=" * 60)
 
+    # 初始化通知器
+    notifier = Notifier(output_dir)
+    notifier.notify_step_start("translate")
+
     # 查找所有 .ocr.json 文件
     json_files = sorted(input_dir.glob("*.ocr.json"))
     if not json_files:
@@ -506,7 +637,31 @@ def step_translate(input_dir: Path, output_dir: Path, output_format: str = "mark
     for json_file in json_files:
         base_name = json_file.stem.replace(".ocr", "")
         safe_name = sanitize_filename(base_name)
-        checkpoint_file = output_dir / f"{safe_name}.translate.json"
+
+        # 从 OCR JSON 读取页数范围，生成文件名后缀
+        page_range_suffix = ""
+        try:
+            with open(json_file, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            pr_start = meta.get("page_range_start")
+            pr_end = meta.get("page_range_end")
+            actual_total = meta.get("actual_total_pages")
+            if pr_start is not None and pr_end is not None and actual_total is not None:
+                if pr_start != 1 or pr_end != actual_total:
+                    page_range_suffix = f"_p{pr_start}-{pr_end}"
+        except Exception:
+            pass
+
+        checkpoint_file = output_dir / f"{safe_name}{page_range_suffix}.translate.json"
+
+        # 检查最终输出是否已存在（跳过已完成翻译）
+        translation_dir = PROJECT_ROOT / "translation"
+        if (translation_dir / f"{safe_name}{page_range_suffix}.md").exists() or \
+           (translation_dir / f"{safe_name}{page_range_suffix}_translated.txt").exists():
+            logger.info(f"跳过已翻译: {safe_name}{page_range_suffix}（输出文件已存在）")
+            success += 1
+            continue
+
         logger.info(f"翻译: {json_file.name}")
         start_time = time.time()
 
@@ -530,6 +685,16 @@ def step_translate(input_dir: Path, output_dir: Path, output_format: str = "mark
             # ─── 断点续翻：加载 checkpoint ───
             translated_pages: List[Optional[List[OCRElement]]] = [None] * total_pages
             start_page = 0
+
+            # 优先检查最终输出 .md 是否已存在（完整翻译）
+            md_output = translation_dir / f"{safe_name}{page_range_suffix}.md"
+            txt_output = translation_dir / f"{safe_name}{page_range_suffix}_translated.txt"
+            if md_output.exists() or txt_output.exists():
+                logger.info(f"检测到已完成翻译，跳过: {safe_name}{page_range_suffix}")
+                success += 1
+                continue
+
+            # 加载 checkpoint 进行断点续翻
             if checkpoint_file.exists():
                 try:
                     with open(checkpoint_file, "r", encoding="utf-8") as f:
@@ -544,6 +709,9 @@ def step_translate(input_dir: Path, output_dir: Path, output_format: str = "mark
                     logger.info(
                         f"断点续翻: 从第 {start_page + 1}/{total_pages} 页继续"
                     )
+                    # 扩展列表以匹配当前页数
+                    while len(translated_pages) < total_pages:
+                        translated_pages.append(None)
                 except Exception as e:
                     logger.warning(f"Checkpoint 加载失败，从头开始: {e}")
                     start_page = 0
@@ -567,8 +735,7 @@ def step_translate(input_dir: Path, output_dir: Path, output_format: str = "mark
                         for tp in translated_pages
                     ],
                 }
-                with open(checkpoint_file, "w", encoding="utf-8") as f:
-                    json.dump(ckpt_data, f, ensure_ascii=False)
+                _atomic_write_json(checkpoint_file, ckpt_data)
 
             progress.close()
 
@@ -580,25 +747,29 @@ def step_translate(input_dir: Path, output_dir: Path, output_format: str = "mark
 
             if output_format == "text":
                 final_text = translator._pages_to_plain_text(final_pages)
-                output_file = translation_dir / f"{safe_name}_translated.txt"
-                with open(output_file, "w", encoding="utf-8") as f:
-                    f.write(final_text)
+                output_file = translation_dir / f"{safe_name}{page_range_suffix}_translated.txt"
+                _atomic_write_text(output_file, final_text)
             else:
                 generator = create_markdown_generator()
                 final_markdown = generator.generate_document(final_pages)
-                output_file = translation_dir / f"{safe_name}.md"
-                with open(output_file, "w", encoding="utf-8") as f:
-                    f.write(final_markdown)
+                output_file = translation_dir / f"{safe_name}{page_range_suffix}.md"
+                _atomic_write_text(output_file, final_markdown)
 
             elapsed = time.time() - start_time
             logger.info(f"  完成: 耗时 {elapsed:.1f}s → {output_file.name}")
+            # 发送单文件翻译完成通知
+            notifier.notify_step_progress("translate", current=success + 1, total=len(json_files),
+                                          file=json_file.name, elapsed=elapsed,
+                                          output=str(output_file))
             success += 1
 
         except Exception as e:
             logger.error(f"  翻译失败: {json_file.name}, {e}")
             logger.info(f"  进度已保存至 checkpoint: {checkpoint_file.name}")
+            notifier.notify_step_error("translate", str(e), file=json_file.name)
 
     logger.info(f"翻译步骤完成: {success}/{len(json_files)} 个文件")
+    notifier.notify_step_done("translate", success=success, total=len(json_files))
     return success
 
 
@@ -641,7 +812,7 @@ def main():
             logger.error(str(e))
             sys.exit(1)
         logger.info(f"找到 {len(pdf_files)} 个 PDF 文件")
-        step_ocr(pdf_files, output_dir, dpi=args.dpi)
+        step_ocr(pdf_files, output_dir, dpi=args.dpi, max_pages=args.max_pages)
         return
 
     elif args.step == "translate":
@@ -704,6 +875,17 @@ def main():
     for f in output_files:
         logger.info(f"  - {f}")
     logger.info("=" * 60)
+
+    # 发送流水线完成通知
+    notifier = Notifier(output_dir)
+    if output_files:
+        notifier.notify_pipeline_done(
+            success=len(output_files),
+            total=len(pdf_files),
+            output_files=[str(f) for f in output_files]
+        )
+    else:
+        notifier.notify_pipeline_error("所有文件处理失败")
 
 
 if __name__ == "__main__":

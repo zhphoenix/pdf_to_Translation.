@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# Unlimited-OCR 两阶段流水线（解决 16GB 显存不足问题）
+# PaddleOCR 两阶段流水线（解决 16GB 显存不足问题）
 #
 # 策略：OCR 和翻译模型串行运行，避免同时占用 GPU 显存
 #   阶段 1: 启动 OCR 容器 (docker compose) → 处理全部 PDF → docker stop ocr
@@ -9,7 +9,6 @@
 # 容器管理:
 #   OCR 容器:    docker compose up -d / docker stop ocr
 #   翻译容器:    docker start sisyphus / docker stop sisyphus (由 ai-platform 管理)
-#   OCR 健康:    curl -sf http://localhost:8000/health
 #   翻译健康:    curl -sf http://localhost:8080/health
 #
 # 用法:
@@ -25,9 +24,23 @@ set -e
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INPUT="${1:-input/}"
 OUTPUT_DIR="${PROJECT_DIR}/output"
-OCR_CONTAINER="ocr"
+OCR_CONTAINER="paddleocr-genai"
 # 翻译容器（由 ai-platform 独立管理，此处仅 docker start/stop）
 TRANS_CONTAINER="sisyphus"
+
+# ─── 信号捕获：中断时清理容器状态 ───
+cleanup() {
+    local exit_code=$?
+    echo ""
+    echo -e "\033[1;33m[$(date '+%H:%M:%S')]\033[0m 脚本退出 (code=$exit_code)，清理容器状态..."
+    # 停止 OCR 容器（如果正在运行）
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${OCR_CONTAINER}$"; then
+        echo -e "\033[1;33m[$(date '+%H:%M:%S')]\033[0m 停止 OCR 容器: ${OCR_CONTAINER}"
+        docker stop "${OCR_CONTAINER}" > /dev/null 2>&1 || true
+    fi
+    echo -e "\033[1;33m[$(date '+%H:%M:%S')]\033[0m 容器清理完成"
+}
+trap cleanup EXIT INT TERM
 
 # 输出格式
 OUTPUT_FORMAT="markdown"
@@ -174,3 +187,21 @@ log "═════════════════════════
 # 显示输出文件
 echo ""
 ls -lh "${OUTPUT_DIR}/"*.md "${OUTPUT_DIR}/"*.txt 2>/dev/null || true
+
+# 发送流水线完成信号（供 IDE 监听）
+STATUS_FILE="${OUTPUT_DIR}/.pipeline_status.json"
+TIMESTAMP=$(date +%s.%N)
+PID=$$
+cat > "$STATUS_FILE" << EOF
+{
+  "event": "pipeline_done",
+  "step": "full",
+  "timestamp": ${TIMESTAMP},
+  "pid": ${PID},
+  "data": {
+    "output_dir": "${OUTPUT_DIR}",
+    "output_format": "${OUTPUT_FORMAT}"
+  }
+}
+EOF
+log "✓ 信号已发送: ${STATUS_FILE}"

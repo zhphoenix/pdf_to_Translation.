@@ -70,7 +70,7 @@ def create_ocr_engine():
     return create_paddleocr_engine()
 """
 OCR 模块
-调用 Unlimited-OCR vLLM API（OpenAI Compatible API）进行图片文字识别
+调用 PaddleOCR-VL vLLM API（OpenAI Compatible API）进行图片文字识别
 输出结构化 OCR 结果（类型 + 坐标 + 文本）
 
 vLLM 部署要求:
@@ -252,7 +252,7 @@ def parse_ocr_output(raw: str, page_num: int = 0) -> List[OCRElement]:
 
 # ─── OCR 引擎 ──────────────────────────────────────────────────────
 class OCREngine:
-    """OCR 引擎类，封装 Unlimited-OCR vLLM API 调用"""
+    """OCR 引擎类，封装 PaddleOCR-VL vLLM API 调用"""
 
     def __init__(
         self,
@@ -271,7 +271,7 @@ class OCREngine:
             max_retries: 最大重试次数
         """
         self.api_base = api_base or config.get("ocr.api_base", "http://localhost:8000/v1")
-        self.model = model or config.get("ocr.model", "unlimited-ocr")
+        self.model = model or config.get("ocr.model", "paddleocr")
         self.timeout = timeout or config.get("ocr.timeout", 300)
         self.max_retries = max_retries or config.get("ocr.max_retries", 3)
 
@@ -437,13 +437,13 @@ def create_ocr_engine():
     创建 OCR 引擎实例
 
     根据配置 ocr.engine 选择引擎:
-    - "unlimited-ocr": Unlimited-OCR vLLM API (默认)
+    - "paddleocr": PaddleOCR-VL 全流水线服务 (默认)
     - "paddleocr": PaddleOCR-VL 全流水线服务
 
     Returns:
         OCR 引擎实例（OCREngine 或 PaddleOCREngine）
     """
-    engine_type = config.get("ocr.engine", "unlimited-ocr")
+    engine_type = config.get("ocr.engine", "paddleocr")
 
     if engine_type == "paddleocr":
         from .paddleocr_engine import create_paddleocr_engine
