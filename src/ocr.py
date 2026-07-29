@@ -207,9 +207,11 @@ class OCREngine:
 
         # vLLM 专用参数
         self.skip_special_tokens = config.get("ocr.skip_special_tokens", False)
-        self.ngram_size = config.get("ocr.ngram_size", 35)
+        self.ngram_size = config.get("ocr.ngram_size", 15)
         self.ngram_window_single = config.get("ocr.ngram_window_single", 128)
         self.ngram_window_multi = config.get("ocr.ngram_window_multi", 1024)
+        self.repetition_penalty = config.get("ocr.repetition_penalty", 1.1)
+        self.temperature = config.get("ocr.temperature", 0.1)
 
         # 初始化 OpenAI 客户端
         self.client = OpenAI(
@@ -218,7 +220,11 @@ class OCREngine:
             timeout=self.timeout
         )
 
-        logger.info(f"OCR 引擎初始化: {self.api_base}, 模型: {self.model}")
+        logger.info(
+            f"OCR 引擎初始化: {self.api_base}, 模型: {self.model}, "
+            f"temp={self.temperature}, rep_penalty={self.repetition_penalty}, "
+            f"ngram_size={self.ngram_size}"
+        )
 
     def ocr_image(self, image_path: Path, page_num: int = 0) -> List[OCRElement]:
         """
@@ -331,9 +337,10 @@ class OCREngine:
                     model=self.model,
                     messages=messages,
                     max_tokens=16384,
-                    temperature=0,
+                    temperature=self.temperature,
                     extra_body={
                         "skip_special_tokens": self.skip_special_tokens,
+                        "repetition_penalty": self.repetition_penalty,
                         "vllm_xargs": {
                             "ngram_size": self.ngram_size,
                             "window_size": window_size,

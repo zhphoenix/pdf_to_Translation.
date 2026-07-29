@@ -8,7 +8,7 @@
 
 import re
 from collections import Counter
-from typing import List, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 from . import config
 from .utils import get_logger
@@ -17,10 +17,7 @@ from .ocr import OCRElement
 logger = get_logger()
 
 # 需要过滤的元素类型
-FILTER_TYPES = {"header", "footer", "page_number"}
-
-# 内容元素类型
-CONTENT_TYPES = {"text", "title", "caption", "list_item", "table_cell"}
+FILTER_TYPES = {"header", "footer", "page_number", "image_footnote"}
 
 
 class StructuredPostProcessor:
@@ -31,13 +28,36 @@ class StructuredPostProcessor:
         "The Ground Truth image displays",
         "The image contains no text",
         "According to Rule",
+        "The following table provides",    # OCR 元数据注释泄漏
+        "The second line is a stylistic",  # OCR 排版分析泄漏
+        "The English text in the source image is a single",  # OCR 图像描述泄漏
+        "The best answer in this case is",     # 无关问答文本泄漏
     )
+
+    # OCR 幻觉模式正则（t2t2 重复 token、荒谬大数字等）
+    HALLUCINATION_PATTERNS = [
+        re.compile(r'^t2t2[,0]*$'),                          # t2t2,000,000,... 纯幻觉 token
+        re.compile(r'^#\s*t2t2'),                             # # t2t2,... 被标记为标题
+        re.compile(r't2t2[,\d]{20,}'),                        # 包含超长 t2t2 数字串
+        re.compile(r'^10\^[2-9]\d$'),                         # 10^36, 10^42 等荒谬大指数
+        re.compile(r'^[\d.]+\s*[×xX]\s*10[³²⁶⁸⁰⁴⁷⁹\^]'),    # 2.2×10³⁶ 等
+        re.compile(r'^[\d.]+\s*[×xX]\s*10\^\d{2,}'),        # 2.2×10^36 等
+        re.compile(r'^\|?\|+$'),                               # |||| 纯竖线
+        re.compile(r'^[\d,]{50,}$'),                           # 超长纯数字串（50+字符）
+        re.compile(r'^(\S+)(?:\s+\1){5,}\s*$'),              # 同一 token 重复 6+ 次（如 "1 1 1 1..."）
+        re.compile(r'(\[Non-Text\]\s*){3,}', re.IGNORECASE), # [Non-Text] 标记重复 3+ 次
+        re.compile(r'^\[No text detected\]\s*$', re.IGNORECASE),  # [No text detected] 占位符
+        re.compile(r'The following table provides the original text', re.IGNORECASE),  # OCR 元数据注释泄漏
+        re.compile(r'^(?:\d+\.\s*){10,}\s*$'),                     # 纯编号序列（如 "1. 2. 3. ... 99."）
+        re.compile(r'^1\.\s+\d{4}[,年]', re.MULTILINE),             # 编号事实幻觉（"1. 2017..." 重复以 1. 开头）
+    ]
 
     def __init__(self):
         """初始化后处理器"""
         self.remove_headers = config.get("postprocess.remove_headers", True)
         self.remove_footers = config.get("postprocess.remove_footers", True)
         self.remove_page_numbers = config.get("postprocess.remove_page_numbers", True)
+        self.remove_tables = config.get("postprocess.remove_tables", True)
         self.remove_ads = config.get("postprocess.remove_ads", True)
         self.merge_broken_lines = config.get("postprocess.merge_broken_lines", True)
 
@@ -52,6 +72,10 @@ class StructuredPostProcessor:
             config.get("postprocess.quality_filter.hallucination_prefixes",
                        list(self.HALLUCINATION_PREFIXES))
         )
+        self.hallucination_patterns = [
+            re.compile(p.pattern, p.flags)
+            for p in self.HALLUCINATION_PATTERNS
+        ]
 
         # 广告关键词
         self.ad_patterns = config.get("postprocess.ad_patterns", [
@@ -144,14 +168,21 @@ class StructuredPostProcessor:
         result = []
 
         for elem in elements:
+            etype = elem.type
             # 过滤页眉
-            if self.remove_headers and elem.type == "header":
+            if self.remove_headers and etype == "header":
                 continue
             # 过滤页脚
-            if self.remove_footers and elem.type == "footer":
+            if self.remove_footers and etype == "footer":
                 continue
             # 过滤页码
-            if self.remove_page_numbers and elem.type == "page_number":
+            if self.remove_page_numbers and etype == "page_number":
+                continue
+            # 过滤 HTML 表格（OCR 输出的表格质量通常较差）
+            if self.remove_tables and etype == "table":
+                continue
+            # 过滤图片脚注（OCR 幻觉高发区：编号序列、en-dash 年份重复）
+            if etype == "image_footnote":
                 continue
             result.append(elem)
 
@@ -363,13 +394,206 @@ class StructuredPostProcessor:
                         )
                         continue  # 截断后太短，丢弃
 
+            # 检测3: 荒谬未来日期（OCR 幻觉生成年份序列到 2100+）
+            if self._has_absurd_future_dates(text):
+                logger.warning(
+                    f"[质量过滤] Page {page}: 移除荒谬未来日期文本 "
+                    f"(len={len(text)}, 开头: {text[:60]}...)"
+                )
+                continue
+
+            # 检测4: 年份区间序列幻觉（如 2017-18, 2018-19, ... 2099-100）
+            yr_truncated = self._truncate_year_range_hallucination(text)
+            if yr_truncated is not None:
+                logger.warning(
+                    f"[质量过滤] Page {page}: 截断年份区间序列幻觉 "
+                    f"(原长={len(text)}, 截断后={len(yr_truncated)})"
+                )
+                elem = OCRElement(
+                    type=elem.type, bbox=elem.bbox,
+                    text=yr_truncated, page=elem.page
+                )
+
+            # 检测5: 段落内句子重复（同一段落被复制两遍）
+            cur_text = elem.text.strip()
+            sr_truncated = self._truncate_sentence_repeats(cur_text)
+            if sr_truncated is not None:
+                logger.warning(
+                    f"[质量过滤] Page {page}: 截断重复段落 "
+                    f"(原长={len(cur_text)}, 截断后={len(sr_truncated)})"
+                )
+                elem = OCRElement(
+                    type=elem.type, bbox=elem.bbox,
+                    text=sr_truncated, page=elem.page
+                )
+
+            # 检测6: 短语级重复（同一短语重复 8+ 次）
+            cur_text = elem.text.strip()
+            pr_truncated = self._truncate_phrase_repetition(cur_text)
+            if pr_truncated is not None:
+                logger.warning(
+                    f"[质量过滤] Page {page}: 截断短语重复 "
+                    f"(原长={len(cur_text)}, 截断后={len(pr_truncated)})"
+                )
+                elem = OCRElement(
+                    type=elem.type, bbox=elem.bbox,
+                    text=pr_truncated, page=elem.page
+                )
+
             result.append(elem)
 
         return result
 
+    def _truncate_phrase_repetition(self, text: str) -> Optional[str]:
+        """
+        检测短语级重复并在重复起点截断。
+
+        OCR 幻觉特征：同一短语（3-8词）在文本中重复出现 8+ 次，
+        且高频短语占总 token 数超过 40%。
+
+        Returns:
+            截断后的文本，或 None（无幻觉）。
+        """
+        words = text.split()
+        if len(words) < 20:
+            return None
+
+        # 检查 3-8 词短语
+        for phrase_len in range(3, 9):
+            phrases = []
+            for i in range(len(words) - phrase_len + 1):
+                phrase = ' '.join(words[i:i + phrase_len]).lower()
+                phrases.append(phrase)
+            if not phrases:
+                continue
+
+            counter = Counter(phrases)
+            most_common_phrase, count = counter.most_common(1)[0]
+
+            # 同一短语出现 8+ 次，且占 token 数超过 40%
+            if count >= 8 and (count * phrase_len / len(words)) > 0.4:
+                # 在第一次出现处截断
+                first_idx = phrases.index(most_common_phrase)
+                truncated = ' '.join(words[:first_idx])
+                if len(truncated) >= 50:
+                    return truncated
+        return None
+
     def _is_hallucination(self, text: str) -> bool:
-        """检测文本是否为 OCR 模型幻觉（系统提示词泄漏）"""
-        return text.startswith(self.hallucination_prefixes)
+        """检测文本是否为 OCR 模型幻觉（系统提示词泄漏或重复退化 token）"""
+        if text.startswith(self.hallucination_prefixes):
+            return True
+        # 检查幻觉模式（t2t2、荒谬大数字等）
+        for pattern in self.hallucination_patterns:
+            if pattern.search(text):
+                return True
+        return False
+
+    # 检测荒谬未来年份的正则
+    _RE_FUTURE_YEAR = re.compile(r'\b(2[1-9]\d{2})\b')  # 2100-2999
+    # 检测未来十年格式的正则（如 "the 2100s"）
+    _RE_FUTURE_DECADE = re.compile(r'\bthe (2[1-9]\d{2})s\b')
+
+    def _has_absurd_future_dates(self, text: str) -> bool:
+        """
+        检测文本是否包含荒谬未来年份序列。
+        
+        OCR 幻觉特征：生成从当前年份一直递增到 2100+ 的日期序列。
+        判定规则：如果文本中包含 3 个以上 2100+ 的年份（含十年格式），视为幻觉。
+        """
+        if len(text) < 200:
+            return False
+        future_years = self._RE_FUTURE_YEAR.findall(text)
+        future_decades = self._RE_FUTURE_DECADE.findall(text)
+        return (len(future_years) + len(future_decades)) >= 3
+
+    # 检测年份区间序列的正则（如 "2017-18", "2098-99"）
+    _RE_YEAR_RANGE = re.compile(r'\b\d{4}-\d{2,4}\b')
+    # 检测十年序列的正则（如 "the 1980s, the 1990s, ..."）
+    _RE_DECADE_SEQ = re.compile(r'\bthe \d{4}s\b')
+
+    def _truncate_year_range_hallucination(self, text: str) -> Optional[str]:
+        """
+        检测年份区间/十年序列幻觉并在幻觉起点截断。
+
+        OCR 幻觉特征：生成连续递增的年份区间序列（如 2017-18, 2018-19, ... 2099-100）
+        或十年序列（如 the 1980s, the 1990s, ... the 2999s）。
+        判定规则：文本中出现 5+ 年份区间 或 8+ 十年模式。
+
+        Returns:
+            截断后的文本（保留幻觉前的有效内容），或 None（无幻觉或截断后过短）。
+        """
+        yr_matches = list(self._RE_YEAR_RANGE.finditer(text))
+        decade_matches = list(self._RE_DECADE_SEQ.finditer(text))
+        # 任一模式达到阈值即触发截断
+        yr_triggered = len(yr_matches) >= 5
+        dec_triggered = len(decade_matches) >= 8
+        if not yr_triggered and not dec_triggered:
+            return None
+        # 在最早的幻觉起点处截断
+        candidates = []
+        if yr_triggered:
+            candidates.append(yr_matches[0].start())
+        if dec_triggered:
+            candidates.append(decade_matches[0].start())
+        cut_pos = min(candidates)
+        truncated = text[:cut_pos].rstrip()
+        if len(truncated) < 50:
+            return None
+        return truncated
+
+    def _truncate_sentence_repeats(self, text: str) -> Optional[str]:
+        """
+        检测段落内句子重复并在重复起点截断。
+
+        OCR 幻觉特征：同一段落在文本中被完整复制两遍。
+        判定规则：超过 30% 的长句子（>30字符）出现 2 次以上。
+
+        Returns:
+            截断后的文本（保留到第一次重复前），或 None（无重复）。
+        """
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        if len(sentences) < 4:
+            return None
+
+        # 统计长句子出现次数
+        seen = {}
+        for i, s in enumerate(sentences):
+            key = s.strip()[:80]
+            if len(key) < 30:
+                continue
+            if key not in seen:
+                seen[key] = []
+            seen[key].append(i)
+
+        # 检查是否有重复的长句子
+        repeated = {k: v for k, v in seen.items() if len(v) >= 2}
+        if not repeated:
+            return None
+
+        # 计算重复比例
+        total_long = sum(1 for s in sentences if len(s.strip()) > 30)
+        repeated_count = sum(len(v) for v in repeated.values())
+        if total_long == 0 or repeated_count / total_long < 0.3:
+            return None
+
+        # 找到最早重复句子的第二次出现位置，在此截断
+        earliest_second = min(v[1] for v in repeated.values())
+        # 找重复块中第一次出现的最大索引（重复块的结束位置）
+        max_first = max(v[0] for v in repeated.values())
+        # 保留从开头到重复块结束（包含整个第一段）
+        cut_sentence_idx = max_first + 1
+        # 计算截断位置（字符位置）
+        pos = 0
+        for i, s in enumerate(sentences):
+            if i >= cut_sentence_idx:
+                break
+            pos += len(s) + 1  # +1 for the separator
+
+        truncated = text[:pos].rstrip()
+        if len(truncated) < 50:
+            return None
+        return truncated
 
     @staticmethod
     def _ngram_unique_ratio(text: str, n: int) -> float:

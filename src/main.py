@@ -582,9 +582,6 @@ def step_translate(input_dir: Path, output_dir: Path, output_format: str = "mark
             progress = create_progress_bar(total_pages, f"翻译 {safe_name[:25]}")
             progress.update(start_page)  # 跳过已完成页
 
-            # 每 N 页保存一次中间输出（稳定性保障）
-            interim_save_interval = 10
-
             for i in range(start_page, total_pages):
                 translated_pages[i] = translator.translate_elements(pages[i])
                 progress.update(1)
@@ -602,36 +599,25 @@ def step_translate(input_dir: Path, output_dir: Path, output_format: str = "mark
                 with open(checkpoint_file, "w", encoding="utf-8") as f:
                     json.dump(ckpt_data, f, ensure_ascii=False)
 
-                # 每 N 页保存一次中间 Markdown 输出（稳定性保障）
-                if (i + 1) % interim_save_interval == 0 or i == total_pages - 1:
-                    interim_pages = [tp if tp is not None else pages[j] for j, tp in enumerate(translated_pages)]
-                    generator = create_markdown_generator()
-                    interim_md = generator.generate_document(interim_pages)
-                    interim_file = output_dir / f"{safe_name}.interim.md"
-                    with open(interim_file, "w", encoding="utf-8") as f:
-                        f.write(interim_md)
-                    logger.debug(f"中间输出已保存: {interim_file.name} ({i + 1}/{total_pages} 页)")
-
             progress.close()
 
-            # ─── 生成最终输出 ───
+            # ─── 生成最终输出（Markdown 保存到 translation/ 文件夹）───
+            translation_dir = PROJECT_ROOT / "translation"
+            translation_dir.mkdir(parents=True, exist_ok=True)
+
             final_pages = [tp if tp is not None else pages[i] for i, tp in enumerate(translated_pages)]
 
             if output_format == "text":
                 final_text = translator._pages_to_plain_text(final_pages)
-                output_file = output_dir / f"{safe_name}_translated.txt"
+                output_file = translation_dir / f"{safe_name}_translated.txt"
                 with open(output_file, "w", encoding="utf-8") as f:
                     f.write(final_text)
             else:
                 generator = create_markdown_generator()
                 final_markdown = generator.generate_document(final_pages)
-                output_file = output_dir / f"{safe_name}.md"
+                output_file = translation_dir / f"{safe_name}.md"
                 with open(output_file, "w", encoding="utf-8") as f:
                     f.write(final_markdown)
-
-            # 翻译完成，删除 checkpoint
-            if checkpoint_file.exists():
-                checkpoint_file.unlink()
 
             elapsed = time.time() - start_time
             logger.info(f"  完成: 耗时 {elapsed:.1f}s → {output_file.name}")

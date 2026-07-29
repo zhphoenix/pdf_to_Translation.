@@ -7,9 +7,11 @@ ocr:
   max_retries: 3
   concurrency: 3                  # 客户端并发请求数（利用 vLLM continuous batching）
   skip_special_tokens: false      # vLLM 必需：保留 <|det|> 标记
-  ngram_size: 35                  # 防重复 n-gram 大小
-  ngram_window_single: 128        # 单页窗口
+  ngram_size: 15                  # 防重复 n-gram 大小（原35→15，更早拦截短重复模式）
+  ngram_window_single: 128        # 单页窗口（模型滑动窗口硬限制）
   ngram_window_multi: 1024        # 多页窗口
+  repetition_penalty: 1.1         # vLLM 原生重复惩罚（>1.0 抑制重复，1.0=无惩罚）
+  temperature: 0.1                # 微调采样温度（0=greedy易陷入重复陷阱，0.1轻微随机性）
 
 pdf:
   dpi: 300
@@ -33,6 +35,7 @@ postprocess:
   remove_headers: true
   remove_footers: true
   remove_page_numbers: true
+  remove_tables: true          # 过滤 HTML 表格（OCR 表格质量差，过滤后不进入翻译）
   remove_ads: true
   merge_broken_lines: true
   merge_broken_words: true
@@ -53,6 +56,10 @@ postprocess:
       - "The Ground Truth image displays"
       - "The image contains no text"
       - "According to Rule"
+      - "The following table provides"    # OCR 元数据注释泄漏
+      - "The second line is a stylistic"  # OCR 排版分析泄漏
+      - "The English text in the source image is a single"  # OCR 图像描述泄漏
+      - "The best answer in this case is"     # 无关问答文本泄漏
 
 # 翻译服务（本地推理模型 Qwythos-9B-Claude-Mythos）
 # 推理模型特性：响应包含 reasoning_content（思考过程）+ content（译文）

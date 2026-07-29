@@ -308,3 +308,4 @@ ocr:
 pdf:
   ocr_format: "png"
 ```
+# python -m src.main input/ --step ocr && python -m src.main output/ --step translate 

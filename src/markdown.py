@@ -76,6 +76,11 @@ class MarkdownGenerator:
 
         return document
 
+    # 破损 HTML / OCR 垃圾正则
+    _RE_HTML_TAG_LINE = re.compile(r'^</?(?:table|tr|td|th|tbody|thead|colgroup|br|hr)[\s>]')
+    _RE_BROKEN_TABLE_FRAGMENT = re.compile(r'^(?:</td>|</tr>|<td>|<tr>|\|?\|+)$')
+    _RE_HTML_FRAGMENT_TEXT = re.compile(r'(?:</?td>|</?tr>){2,}')  # 多个 HTML 表格标签混杂
+
     def _element_to_markdown(self, elem: OCRElement) -> str:
         """
         将单个元素转换为 Markdown
@@ -88,6 +93,17 @@ class MarkdownGenerator:
         """
         text = elem.text.strip()
         if not text:
+            return ""
+
+        # ─── 过滤破损 HTML 和 OCR 垃圾 ───
+        # 跳过独立 HTML 标签行
+        if self._RE_HTML_TAG_LINE.match(text):
+            return ""
+        # 跳过破损表格片段
+        if self._RE_BROKEN_TABLE_FRAGMENT.match(text):
+            return ""
+        # 跳过包含多个 HTML 表格标签的文本碎片（如 "24 25</td></tr><tr><td>..."）
+        if self._RE_HTML_FRAGMENT_TEXT.search(text):
             return ""
 
         elem_type = elem.type.lower()
@@ -106,6 +122,10 @@ class MarkdownGenerator:
 
         elif elem_type == "list_item":
             return f"- {text}"
+
+        elif elem_type == "table":
+            # table 类型通常已在 postprocess 中过滤，此处作为安全网
+            return ""
 
         elif elem_type == "table_cell":
             # 表格单元格单独处理
